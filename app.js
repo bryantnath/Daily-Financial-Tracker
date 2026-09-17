@@ -1115,12 +1115,90 @@ function processCommand(text) {
     return botSay("Saya bisa membantu Anda:\n\n1. Mencatat transaksi — contoh: \"hari ini pengeluaran 20rb makan siang, 15rb bensin, 50rb belanja\"\n2. Rekap — contoh: \"rekap mingguan\" / \"rekap bulan ini\"\n3. Info saldo — \"berapa saldo saya?\"\n4. Info hutang/piutang — \"hutang saya berapa?\"\n\nAnda juga bisa menekan tombol mik 🎤 untuk bicara langsung.", false);
   }
 
-  // 6) TRANSACTION parsing (default)
+  // 6) TRANSACTION parsing (has numbers → likely a record)
   const { items, isIncome } = parseTransactions(text);
   if (items.length > 0) return botAddTransactions(items, isIncome);
 
-  // fallback
-  botSay("Maaf, saya belum menangkap maksud Anda. 🤔\n\nUntuk mencatat, sebutkan jumlah + keterangan, misalnya:\n\"pengeluaran 25rb makan, 10rb parkir\"\n\nAtau minta \"rekap bulan ini\".", false);
+  // 7) Conversational / small talk (natural chat like a personal assistant)
+  if (chitChat(text)) return;
+
+  // fallback — friendly, not a dead-end
+  const tips = [
+    `Hmm, saya belum yakin menangkap maksudnya. 🤔 Saya paling jago soal keuangan Anda — coba katakan misalnya "pengeluaran 25rb makan siang", atau tanya "berapa saldo saya?"`,
+    `Boleh diulang dengan cara lain? Misalnya "catat 50rb belanja", "rekap minggu ini", atau "hutang saya berapa?" 😊`,
+    `Saya di sini untuk bantu keuangan Anda. Anda bisa mencatat pengeluaran, minta rekap, atau tanya saldo/hutang kapan saja.`
+  ];
+  botSay(pick(tips), true);
+}
+
+/* ---- pick a random variant so replies don't feel robotic ---- */
+function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+/* ---- conversational layer: greetings, small talk, identity, thanks ---- */
+function chitChat(text) {
+  const low = ' ' + text.toLowerCase().replace(/[.,!?]/g, ' ').replace(/\s+/g, ' ').trim() + ' ';
+  const name = botName();
+  const hour = new Date().getHours();
+  const greetTime = hour < 11 ? 'Selamat pagi' : hour < 15 ? 'Selamat siang' : hour < 19 ? 'Selamat sore' : 'Selamat malam';
+
+  // Greeting (halo / hi / hey / pagi / assalamualaikum / calling the bot's name)
+  if (/\b(halo|hallo|hai|hi|hey|hei|helo|woy|oi|p)\b/.test(low)
+      || low.includes(name.toLowerCase())
+      || /\b(pagi|siang|sore|malam)\b/.test(low)
+      || /assalam/.test(low)) {
+    return botSay(pick([
+      `${greetTime}! 👋 Saya ${name}, siap membantu keuangan Anda. Ada yang bisa saya bantu hari ini?`,
+      `Halo juga! 😊 ${name} di sini. Mau catat transaksi, lihat rekap, atau cek saldo?`,
+      `Hai! Senang Anda menyapa. Ada yang ingin dicatat atau ditanyakan soal keuangan Anda?`
+    ]), true), true;
+  }
+
+  // How are you
+  if (/(apa kabar|gimana kabar|how are you|kabarnya|sehat)/.test(low)) {
+    return botSay(pick([
+      `Saya baik, terima kasih sudah bertanya! 😄 Yang penting keuangan Anda juga sehat. Mau saya bantu cek rekap hari ini?`,
+      `Selalu semangat membantu Anda! 💪 Bagaimana dengan Anda? Ada pengeluaran yang mau dicatat?`
+    ]), true), true;
+  }
+
+  // Identity / who are you / your name
+  if (/(siapa kamu|siapa km|kamu siapa|nama kamu|namamu|kamu ini apa|who are you|kenalan)/.test(low)) {
+    return botSay(`Saya ${name}, asisten keuangan pribadi Anda di FinTrack. 😊 Saya bisa mencatat pemasukan & pengeluaran, memberi rekap harian sampai tahunan, dan menjawab pertanyaan soal saldo, hutang, atau piutang Anda. Anda bisa ketik atau bicara langsung ke saya.`, true), true;
+  }
+
+  // What can you do
+  if (/(bisa apa|kemampuan|fungsi kamu|kegunaan)/.test(low)) {
+    return botSay(`Banyak yang bisa saya bantu! 💡\n• Mencatat transaksi ("catat 20rb kopi")\n• Rekap keuangan ("rekap bulan ini")\n• Cek saldo ("berapa saldo saya?")\n• Info hutang & piutang\n\nCukup katakan saja, saya yang urus.`, true), true;
+  }
+
+  // Thanks
+  if (/(makasih|terima kasih|thanks|thank you|thx|tengkyu|mksh|nuhun|suwun)/.test(low)) {
+    return botSay(pick([
+      `Sama-sama! 😊 Senang bisa membantu. Kalau ada lagi, panggil saja saya.`,
+      `Dengan senang hati! 🙌 Semoga keuangan Anda makin teratur ya.`,
+      `Kapan saja, itu tugas saya. 😄`
+    ]), true), true;
+  }
+
+  // Goodbye
+  if (/(bye|dadah|dah|sampai jumpa|udahan|selesai|makasih ya)/.test(low)) {
+    return botSay(pick([
+      `Sampai jumpa lagi! 👋 Jangan lupa catat pengeluaran hari ini ya.`,
+      `Oke, saya tunggu kapan pun Anda butuh. Semangat! 😊`
+    ]), true), true;
+  }
+
+  // Praise / affirmation
+  if (/(hebat|keren|pintar|pinter|bagus|mantap|good|nice|top)\b/.test(low)) {
+    return botSay(pick([`Terima kasih! 😄 Saya akan terus berusaha membantu Anda sebaik mungkin.`, `Senang mendengarnya! 🙌 Ada lagi yang bisa saya bantu?`]), true), true;
+  }
+
+  // Yes/OK short affirmations → gently prompt
+  if (/^(ya|iya|oke|ok|baik|siap|lanjut|boleh)$/.test(text.toLowerCase().trim())) {
+    return botSay(`Siap! 😊 Silakan katakan apa yang ingin Anda catat atau tanyakan.`, true), true;
+  }
+
+  return false; // not chit-chat → let caller run fallback
 }
 
 function botAddTransactions(items, isIncome) {
@@ -1198,6 +1276,11 @@ function stripForSpeech(t) { return String(t).replace(/[•*#_>]/g,'').replace(/
 let recognition = null, isListening = false;
 let allVoices = [];        // all voices available in the browser
 let selectedVoice = null;  // the chosen voice object
+// --- patient listening state ---
+let silenceTimer = null;           // fires after the user stays quiet
+let voiceFinalTranscript = '';     // accumulated finalized speech during a session
+let manualStop = false;            // true when the user taps the mic to stop
+const SILENCE_MS = 5000;           // wait 5s of silence before responding
 
 // Names that indicate high-quality / neural / natural voices per platform
 const GOOD_VOICE_HINTS = ['natural','neural','online','google','microsoft','premium','enhanced','wavenet','journey','damayanti','andika','arif','gadis'];
@@ -1207,12 +1290,49 @@ function initSpeech() {
   if (SR) {
     recognition = new SR();
     recognition.lang = 'id-ID';
-    recognition.interimResults = false;
+    recognition.continuous = true;       // keep listening through pauses
+    recognition.interimResults = true;   // so we can detect ongoing speech
     recognition.maxAlternatives = 1;
-    recognition.onstart = () => { isListening = true; document.getElementById('micBtn').classList.add('listening'); setStatus('Mendengarkan…'); };
-    recognition.onend = () => { isListening = false; document.getElementById('micBtn').classList.remove('listening'); setStatus('Siap membantu'); };
-    recognition.onerror = (e) => { isListening = false; document.getElementById('micBtn').classList.remove('listening'); setStatus('Siap membantu'); if (e.error === 'not-allowed') botSay('Izin mikrofon ditolak. Aktifkan izin mikrofon di browser untuk memakai perintah suara.', false); };
-    recognition.onresult = (e) => { const transcript = e.results[0][0].transcript; handleUserMessage(transcript); };
+
+    recognition.onstart = () => {
+      isListening = true; manualStop = false; voiceFinalTranscript = '';
+      document.getElementById('micBtn').classList.add('listening');
+      setStatus('Mendengarkan… (bicara santai, saya menunggu)');
+    };
+
+    recognition.onresult = (e) => {
+      // rebuild finalized + interim text
+      let interim = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const res = e.results[i];
+        if (res.isFinal) voiceFinalTranscript += res[0].transcript + ' ';
+        else interim += res[0].transcript;
+      }
+      const preview = (voiceFinalTranscript + interim).trim();
+      if (preview) {
+        setStatus('Saya dengar: "' + (preview.length > 40 ? preview.slice(0, 40) + '…' : preview) + '"');
+      }
+      // reset the 5s silence countdown every time new speech arrives
+      scheduleSilenceFinalize();
+    };
+
+    recognition.onerror = (e) => {
+      if (e.error === 'no-speech') { return; } // ignore; keep waiting patiently
+      isListening = false; clearTimeout(silenceTimer);
+      document.getElementById('micBtn').classList.remove('listening'); setStatus('Siap membantu');
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed')
+        botSay('Izin mikrofon ditolak. Aktifkan izin mikrofon di browser untuk memakai perintah suara. 🙂', false);
+    };
+
+    recognition.onend = () => {
+      // The engine may auto-stop; if the user hasn't finished and didn't tap stop,
+      // restart so pauses for thinking don't cut them off.
+      if (isListening && !manualStop) {
+        try { recognition.start(); return; } catch (e) { /* fallthrough */ }
+      }
+      isListening = false; clearTimeout(silenceTimer);
+      document.getElementById('micBtn').classList.remove('listening'); setStatus('Siap membantu');
+    };
   }
   if ('speechSynthesis' in window) {
     loadVoices();
@@ -1263,9 +1383,35 @@ function populateVoiceSelect() {
 
 function toggleListening() {
   if (!recognition) { botSay('Maaf, browser Anda belum mendukung input suara. Coba gunakan Google Chrome terbaru. Anda tetap bisa mengetik. 🙂', false); return; }
-  if (isListening) stopListening(); else { try { recognition.start(); } catch(e){} }
+  if (isListening) { finalizeVoiceInput(true); }   // tapping mic = finish now
+  else { try { recognition.start(); } catch(e){} }
 }
-function stopListening() { if (recognition && isListening) { try { recognition.stop(); } catch(e){} } }
+function stopListening() {
+  manualStop = true;
+  clearTimeout(silenceTimer);
+  if (recognition && isListening) { try { recognition.stop(); } catch(e){} }
+  isListening = false;
+  const mic = document.getElementById('micBtn'); if (mic) mic.classList.remove('listening');
+}
+
+// After the user goes quiet for SILENCE_MS, treat their speech as complete.
+function scheduleSilenceFinalize() {
+  clearTimeout(silenceTimer);
+  silenceTimer = setTimeout(() => finalizeVoiceInput(true), SILENCE_MS);
+}
+
+// Send whatever was captured, then stop the mic. `byUser` = user tapped stop.
+function finalizeVoiceInput(byUser) {
+  clearTimeout(silenceTimer);
+  const text = voiceFinalTranscript.trim();
+  manualStop = true;
+  if (recognition) { try { recognition.stop(); } catch (e) {} }
+  isListening = false;
+  const mic = document.getElementById('micBtn'); if (mic) mic.classList.remove('listening');
+  setStatus('Siap membantu');
+  voiceFinalTranscript = '';
+  if (text) handleUserMessage(text);
+}
 
 /* Split text into natural clauses so the synthesizer breathes between them
    instead of reading one long flat monotone line. */
