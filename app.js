@@ -1280,7 +1280,7 @@ let selectedVoice = null;  // the chosen voice object
 let silenceTimer = null;           // fires after the user stays quiet
 let voiceFinalTranscript = '';     // accumulated finalized speech during a session
 let manualStop = false;            // true when the user taps the mic to stop
-const SILENCE_MS = 5000;           // wait 5s of silence before responding
+const SILENCE_MS = 3000;           // wait 3s of silence before responding
 
 // Names that indicate high-quality / neural / natural voices per platform
 const GOOD_VOICE_HINTS = ['natural','neural','online','google','microsoft','premium','enhanced','wavenet','journey','damayanti','andika','arif','gadis'];
