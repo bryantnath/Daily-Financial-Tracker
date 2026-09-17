@@ -147,11 +147,15 @@ function closeSidebar() { document.getElementById('sidebar').classList.remove('o
    CANVAS CHART ENGINE (no dependencies)
    ============================================================ */
 function setupCanvas(canvas) {
+  if (!canvas || !canvas.parentElement) return null;
   const dpr = window.devicePixelRatio || 1;
   const rect = canvas.parentElement.getBoundingClientRect();
   const w = rect.width, h = rect.height;
+  // Bail out if the panel is hidden / not laid out yet (zero size).
+  if (!w || !h || w < 2 || h < 2) return null;
   canvas.width = w * dpr; canvas.height = h * dpr;
-  const ctx = canvas.getContext('2d');
+  const ctx = canvas.getContext && canvas.getContext('2d');
+  if (!ctx || typeof ctx.setTransform !== 'function' || typeof ctx.createLinearGradient !== 'function') return null;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
   return { ctx, w, h };
@@ -161,7 +165,9 @@ function drawLineChart(canvasId, labels, series) {
   // series: [{data:[], color, fill}]
   const canvas = document.getElementById(canvasId);
   if (!canvas) return;
-  const { ctx, w, h } = setupCanvas(canvas);
+  const setup = setupCanvas(canvas);
+  if (!setup) return;
+  const { ctx, w, h } = setup;
   const padL = 44, padR = 12, padT = 14, padB = 26;
   const cw = w - padL - padR, ch = h - padT - padB;
   let max = 0;
@@ -192,12 +198,15 @@ function drawLineChart(canvasId, labels, series) {
       i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
     });
     if (s.fill) {
-      const grad = ctx.createLinearGradient(0, padT, 0, padT + ch);
-      grad.addColorStop(0, s.color + '33'); grad.addColorStop(1, s.color + '00');
-      ctx.lineTo(padL + stepX * (n - 1), padT + ch); ctx.lineTo(padL, padT + ch); ctx.closePath();
-      ctx.fillStyle = grad; ctx.fill();
-      ctx.beginPath();
-      s.data.forEach((v, i) => { const x = padL + stepX * i, y = padT + ch - (ch * v / niceMax); i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y); });
+      let grad = null;
+      try { grad = ctx.createLinearGradient(0, padT, 0, padT + ch); } catch (e) { grad = null; }
+      if (grad && typeof grad.addColorStop === 'function') {
+        grad.addColorStop(0, s.color + '33'); grad.addColorStop(1, s.color + '00');
+        ctx.lineTo(padL + stepX * (n - 1), padT + ch); ctx.lineTo(padL, padT + ch); ctx.closePath();
+        ctx.fillStyle = grad; ctx.fill();
+        ctx.beginPath();
+        s.data.forEach((v, i) => { const x = padL + stepX * i, y = padT + ch - (ch * v / niceMax); i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y); });
+      }
     }
     ctx.strokeStyle = s.color; ctx.lineWidth = 2.5; ctx.lineJoin = 'round'; ctx.stroke();
     // dots
@@ -212,7 +221,9 @@ function drawLineChart(canvasId, labels, series) {
 function drawBarChart(canvasId, labels, values, colors) {
   const canvas = document.getElementById(canvasId);
   if (!canvas) return;
-  const { ctx, w, h } = setupCanvas(canvas);
+  const setup = setupCanvas(canvas);
+  if (!setup) return;
+  const { ctx, w, h } = setup;
   const padL = 44, padR = 12, padT = 14, padB = 26;
   const cw = w - padL - padR, ch = h - padT - padB;
   let max = Math.max(...values, 0); if (max === 0) max = 1;
@@ -242,7 +253,9 @@ function drawDonutChart(canvasId, data) {
   // data: [{label, value, color}]
   const canvas = document.getElementById(canvasId);
   if (!canvas) return;
-  const { ctx, w, h } = setupCanvas(canvas);
+  const setup = setupCanvas(canvas);
+  if (!setup) return;
+  const { ctx, w, h } = setup;
   const cx = w / 2, cy = h / 2;
   const r = Math.min(w, h) / 2 - 10; const inner = r * 0.62;
   const total = data.reduce((s, d) => s + d.value, 0);
@@ -313,7 +326,7 @@ function renderDashboard() {
   }
 
   renderTxList('recentTxList', state.transactions.slice().sort(sortByDateDesc).slice(0, 6), false);
-  renderDashboardCharts();
+  safeRender('dashboard-charts', renderDashboardCharts);
 }
 
 function renderDashboardCharts() {
@@ -469,13 +482,12 @@ function renderRecapPage() {
   document.getElementById('recapCount').textContent = list.length;
 
   // trend chart
-  renderRecapTrend(start, end);
+  safeRender('recap-trend', () => renderRecapTrend(start, end));
 
   // donut + ranking
   const cats = categoryBreakdown(ui.recapAnchor, ui.recapPeriod);
   const donut = cats.slice(0, 8).map((c, i) => ({ label: c.cat, value: c.total, color: CHART_COLORS[i % CHART_COLORS.length] }));
-  drawDonutChart('recapDonutChart', donut);
-  renderLegend('recapDonutLegend', donut);
+  safeRender('recap-donut', () => { drawDonutChart('recapDonutChart', donut); renderLegend('recapDonutLegend', donut); });
 
   const totalExp = cats.reduce((s, c) => s + c.total, 0);
   const rank = document.getElementById('recapRanking');
@@ -687,14 +699,19 @@ function renderBudgetPage() {
 /* ============================================================
    RENDER ALL
    ============================================================ */
+// Run a render step in isolation so one failure never blanks out the others.
+function safeRender(label, fn) {
+  try { fn(); }
+  catch (e) { console.error('[FinTrack] Gagal merender "' + label + '":', e); }
+}
 function renderAll() {
-  renderDashboard();
-  renderTransactionsPage();
-  renderRecapPage();
-  renderDebtsPage();
-  renderAccountsPage();
-  renderBudgetPage();
-  refreshAccountDropdowns();
+  safeRender('dashboard', renderDashboard);
+  safeRender('transactions', renderTransactionsPage);
+  safeRender('recap', renderRecapPage);
+  safeRender('debts', renderDebtsPage);
+  safeRender('accounts', renderAccountsPage);
+  safeRender('budget', renderBudgetPage);
+  safeRender('account-dropdowns', refreshAccountDropdowns);
   save();
 }
 function refreshAccountDropdowns() {
@@ -1256,22 +1273,24 @@ function splitSpeechChunks(text) {
 }
 
 function speakText(text) {
-  if (!('speechSynthesis' in window) || !state.settings.voiceReply) return;
-  speechSynthesis.cancel();
+  if (!('speechSynthesis' in window) || typeof window.SpeechSynthesisUtterance !== 'function' || !state.settings.voiceReply) return;
+  try { speechSynthesis.cancel(); } catch (e) {}
   if (!selectedVoice) loadVoices();
   const rate = Number(state.settings.rate) || 0.98;
   const pitch = Number(state.settings.pitch) || 1.0;
-  const chunks = splitSpeechChunks(text);
-  chunks.forEach((chunk, i) => {
-    const u = new SpeechSynthesisUtterance(chunk);
-    if (selectedVoice) { u.voice = selectedVoice; u.lang = selectedVoice.lang; }
-    else u.lang = 'id-ID';
-    // slight, human-like variation in pace & pitch per clause
-    u.rate = Math.max(0.6, Math.min(1.4, rate + (i % 2 === 0 ? 0 : -0.02)));
-    u.pitch = Math.max(0.5, Math.min(1.5, pitch + (Math.sin(i) * 0.03)));
-    u.volume = 1;
-    speechSynthesis.speak(u);
-  });
+  try {
+    const chunks = splitSpeechChunks(text);
+    chunks.forEach((chunk, i) => {
+      const u = new SpeechSynthesisUtterance(chunk);
+      if (selectedVoice) { u.voice = selectedVoice; u.lang = selectedVoice.lang; }
+      else u.lang = 'id-ID';
+      // slight, human-like variation in pace & pitch per clause
+      u.rate = Math.max(0.6, Math.min(1.4, rate + (i % 2 === 0 ? 0 : -0.02)));
+      u.pitch = Math.max(0.5, Math.min(1.5, pitch + (Math.sin(i) * 0.03)));
+      u.volume = 1;
+      speechSynthesis.speak(u);
+    });
+  } catch (e) { console.error('[FinTrack] speak gagal:', e); }
 }
 
 function setStatus(s) { document.getElementById('assistantStatus').textContent = s; }
