@@ -33,6 +33,45 @@
   --font: 'Plus Jakarta Sans', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
 }
 
+/* ===== DARK THEME ===== */
+[data-theme="dark"] {
+  --primary: #818cf8;
+  --primary-dark: #6366f1;
+  --primary-soft: #1e1b3a;
+  --accent: #38bdf8;
+  --success: #34d399;
+  --success-soft: #0c2a22;
+  --danger: #f87171;
+  --danger-soft: #2c1615;
+  --warning: #fbbf24;
+  --warning-soft: #2b2110;
+  --violet: #a78bfa;
+
+  --bg: #0b1120;
+  --surface: #121a2c;
+  --surface-2: #0f172a;
+  --ink: #f1f5f9;
+  --ink-2: #cbd5e1;
+  --muted: #94a3b8;
+  --faint: #64748b;
+  --line: #223049;
+  --line-strong: #2f4162;
+
+  --shadow-xs: 0 1px 2px rgba(0,0,0,0.3);
+  --shadow-sm: 0 1px 3px rgba(0,0,0,0.4);
+  --shadow-md: 0 6px 20px rgba(0,0,0,0.45);
+  --shadow-lg: 0 20px 48px rgba(0,0,0,0.6);
+  color-scheme: dark;
+}
+/* dark: keep balance cards vivid, adjust a few surfaces */
+[data-theme="dark"] .balance-card.primary { background: linear-gradient(135deg, #4338ca 0%, #6d28d9 100%); }
+[data-theme="dark"] .balance-card.teal { background: linear-gradient(135deg, #0f766e 0%, #0369a1 100%); }
+[data-theme="dark"] .topbar { background: rgba(11,17,32,0.8); }
+[data-theme="dark"] .logo-mark { box-shadow: 0 4px 12px rgba(0,0,0,0.5); }
+[data-theme="dark"] input[type="color"] { background: var(--surface-2); }
+[data-theme="dark"] .msg.bot { background: var(--surface-2); }
+[data-theme="dark"] .account-card::before { opacity: 0.9; }
+
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
 body {
@@ -134,6 +173,12 @@ h1,h2,h3 { letter-spacing: -0.02em; }
   font-family: inherit; transition: all 0.18s;
 }
 .topbar-ai-btn:hover { border-color: var(--primary); background: var(--primary-soft); }
+.theme-toggle {
+  width: 38px; height: 38px; border-radius: 10px; cursor: pointer;
+  background: var(--surface); border: 1px solid var(--line-strong);
+  font-size: 16px; display: grid; place-items: center; transition: all 0.18s; flex-shrink: 0;
+}
+.theme-toggle:hover { border-color: var(--primary); background: var(--primary-soft); }
 .today-chip {
   background: var(--surface); border: 1px solid var(--line-strong);
   padding: 8px 14px; border-radius: 10px; font-size: 12.5px;

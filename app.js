@@ -38,9 +38,9 @@ let state = {
   debts: [],
   budgets: [],
   goals: [],
-  settings: { voiceReply: true, botName: 'FinBot', voiceURI: '', rate: 0.98, pitch: 1.0 }
+  settings: { voiceReply: true, botName: 'FinBot', voiceURI: '', rate: 0.98, pitch: 1.0, theme: 'light' }
 };
-const DEFAULT_SETTINGS = { voiceReply: true, botName: 'FinBot', voiceURI: '', rate: 0.98, pitch: 1.0 };
+const DEFAULT_SETTINGS = { voiceReply: true, botName: 'FinBot', voiceURI: '', rate: 0.98, pitch: 1.0, theme: 'light' };
 
 let ui = {
   quickType: 'income',
@@ -101,6 +101,11 @@ const TX_META = {
   receivable_payment: { icon: '↙', label: 'Terima Piutang', sign: '+', cls: 'plus' }
 };
 const CHART_COLORS = ['#4f46e5','#0ea5e9','#059669','#d97706','#dc2626','#7c3aed','#db2777','#0891b2','#65a30d','#ea580c','#6366f1','#14b8a6'];
+// theme-aware chart neutrals (axis text, gridlines, donut hole)
+function chartInk() { return (state.settings && state.settings.theme === 'dark') ? '#94a3b8' : '#94a3b8'; }
+function chartGrid() { return (state.settings && state.settings.theme === 'dark') ? '#223049' : '#eef0f5'; }
+function chartHole() { return (state.settings && state.settings.theme === 'dark') ? '#121a2c' : '#ffffff'; }
+function chartCenterInk() { return (state.settings && state.settings.theme === 'dark') ? '#f1f5f9' : '#0f172a'; }
 
 /* ---------- CALCULATIONS ---------- */
 function cleanBalance() { return state.accounts.reduce((s,a) => s + Number(a.balance||0), 0); }
@@ -176,7 +181,7 @@ function drawLineChart(canvasId, labels, series) {
   const niceMax = niceNumber(max);
   // grid + y labels
   ctx.font = '11px "Plus Jakarta Sans", sans-serif';
-  ctx.fillStyle = '#94a3b8'; ctx.strokeStyle = '#eef0f5'; ctx.lineWidth = 1;
+  ctx.fillStyle = chartInk(); ctx.strokeStyle = chartGrid(); ctx.lineWidth = 1;
   const steps = 4;
   for (let i = 0; i <= steps; i++) {
     const y = padT + ch - (ch * i / steps);
@@ -185,7 +190,7 @@ function drawLineChart(canvasId, labels, series) {
     ctx.fillText(rpShort(niceMax * i / steps), padL - 8, y);
   }
   // x labels
-  ctx.textAlign = 'center'; ctx.textBaseline = 'top'; ctx.fillStyle = '#94a3b8';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top'; ctx.fillStyle = chartInk();
   const n = labels.length;
   const stepX = n > 1 ? cw / (n - 1) : 0;
   labels.forEach((lb, i) => { ctx.fillText(lb, padL + stepX * i, h - padB + 8); });
@@ -229,7 +234,7 @@ function drawBarChart(canvasId, labels, values, colors) {
   let max = Math.max(...values, 0); if (max === 0) max = 1;
   const niceMax = niceNumber(max);
   ctx.font = '11px "Plus Jakarta Sans", sans-serif';
-  ctx.strokeStyle = '#eef0f5'; ctx.fillStyle = '#94a3b8';
+  ctx.strokeStyle = chartGrid(); ctx.fillStyle = chartInk();
   const steps = 4;
   for (let i = 0; i <= steps; i++) {
     const y = padT + ch - (ch * i / steps);
@@ -244,7 +249,7 @@ function drawBarChart(canvasId, labels, values, colors) {
     const y = padT + ch - bh;
     const col = (colors && colors[i]) || '#4f46e5';
     roundRect(ctx, x, y, bw, bh, 6); ctx.fillStyle = col; ctx.fill();
-    ctx.fillStyle = '#94a3b8'; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    ctx.fillStyle = chartInk(); ctx.textAlign = 'center'; ctx.textBaseline = 'top';
     ctx.fillText(labels[i], padL + slot * i + slot / 2, h - padB + 8);
   });
 }
@@ -261,8 +266,8 @@ function drawDonutChart(canvasId, data) {
   const total = data.reduce((s, d) => s + d.value, 0);
   if (total === 0) {
     ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.arc(cx, cy, inner, 0, Math.PI*2, true);
-    ctx.fillStyle = '#f1f5f9'; ctx.fill('evenodd');
-    ctx.fillStyle = '#94a3b8'; ctx.font = '13px "Plus Jakarta Sans"'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = chartGrid(); ctx.fill('evenodd');
+    ctx.fillStyle = chartInk(); ctx.font = '13px "Plus Jakarta Sans"'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText('Belum ada data', cx, cy);
     return;
   }
@@ -274,11 +279,11 @@ function drawDonutChart(canvasId, data) {
     start += ang;
   });
   // inner hole
-  ctx.beginPath(); ctx.arc(cx, cy, inner, 0, Math.PI*2); ctx.fillStyle = '#fff'; ctx.fill();
+  ctx.beginPath(); ctx.arc(cx, cy, inner, 0, Math.PI*2); ctx.fillStyle = chartHole(); ctx.fill();
   // center text
-  ctx.fillStyle = '#0f172a'; ctx.font = '800 18px "Plus Jakarta Sans"'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = chartCenterInk(); ctx.font = '800 18px "Plus Jakarta Sans"'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   ctx.fillText(rpShort(total), cx, cy - 6);
-  ctx.fillStyle = '#94a3b8'; ctx.font = '600 11px "Plus Jakarta Sans"';
+  ctx.fillStyle = chartInk(); ctx.font = '600 11px "Plus Jakarta Sans"';
   ctx.fillText('Total', cx, cy + 12);
 }
 
@@ -1293,6 +1298,24 @@ function speakText(text) {
   } catch (e) { console.error('[FinTrack] speak gagal:', e); }
 }
 
+/* ---- Theme (light / dark) ---- */
+function applyTheme() {
+  const dark = state.settings.theme === 'dark';
+  document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+  const icon = document.getElementById('themeToggleIcon');
+  if (icon) icon.textContent = dark ? '☀️' : '🌙';
+  const btn = document.getElementById('themeToggle');
+  if (btn) btn.title = dark ? 'Beralih ke tema terang' : 'Beralih ke tema gelap';
+}
+function toggleTheme() {
+  state.settings.theme = state.settings.theme === 'dark' ? 'light' : 'dark';
+  save();
+  applyTheme();
+  // redraw charts so their text/colors match the new theme
+  safeRender('dashboard-charts', renderDashboardCharts);
+  safeRender('recap', renderRecapPage);
+}
+
 function setStatus(s) { document.getElementById('assistantStatus').textContent = s; }
 function updateVoiceToggle() {
   const btn = document.getElementById('voiceReplyToggle');
@@ -1349,6 +1372,7 @@ function init() {
   refreshCategoryDropdown();
   updateVoiceToggle();
   applyBotIdentity();
+  applyTheme();
   initSpeech();
 
   // Navigation (event delegation for dynamic [data-page] too)
@@ -1360,6 +1384,7 @@ function init() {
   document.getElementById('menuBtn').addEventListener('click', openSidebar);
   document.getElementById('sidebarClose').addEventListener('click', closeSidebar);
   document.getElementById('overlay').addEventListener('click', closeSidebar);
+  document.getElementById('themeToggle').addEventListener('click', toggleTheme);
 
   // Quick add tabs
   document.querySelectorAll('.qtab').forEach(tab => tab.addEventListener('click', () => {
