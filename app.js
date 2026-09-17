@@ -38,8 +38,9 @@ let state = {
   debts: [],
   budgets: [],
   goals: [],
-  settings: { voiceReply: true }
+  settings: { voiceReply: true, botName: 'FinBot', voiceURI: '', rate: 0.98, pitch: 1.0 }
 };
+const DEFAULT_SETTINGS = { voiceReply: true, botName: 'FinBot', voiceURI: '', rate: 0.98, pitch: 1.0 };
 
 let ui = {
   quickType: 'income',
@@ -59,7 +60,8 @@ function load() {
       const parsed = JSON.parse(raw);
       // merge to keep new fields (settings) without wiping old data
       state = Object.assign(state, parsed);
-      if (!state.settings) state.settings = { voiceReply: true };
+      // ensure all setting keys exist (backward compatible with older saves)
+      state.settings = Object.assign({}, DEFAULT_SETTINGS, state.settings || {});
     } catch (e) { console.error('Load error', e); }
   }
 }
@@ -913,7 +915,7 @@ function closeAssistant() {
   stopListening();
 }
 function greetAssistant() {
-  botSay("Halo! 👋 Saya Asisten FinTrack. Saya bisa membantu Anda:\n\n• Mencatat pengeluaran/pemasukan cukup dengan bahasa biasa\n• Memberi rekap harian, mingguan, bulanan, tahunan\n• Menjawab pertanyaan soal keuangan Anda\n\nCoba ketik atau ucapkan sesuatu!", false);
+  botSay(`Halo! 👋 Saya ${botName()}, asisten keuangan pribadi Anda. Saya bisa membantu Anda:\n\n• Mencatat pengeluaran/pemasukan cukup dengan bahasa biasa\n• Memberi rekap harian, mingguan, bulanan, tahunan\n• Menjawab pertanyaan soal keuangan Anda\n\nTekan ⚙️ untuk mengganti nama & suara saya. Coba ketik atau ucapkan sesuatu!`, false);
   renderSuggestions(['Pengeluaran hari ini 15rb makan, 10rb parkir', 'Rekap bulan ini', 'Berapa saldo saya?', 'Hutang saya berapa?']);
 }
 function renderSuggestions(arr) {
@@ -1169,8 +1171,15 @@ function stripForSpeech(t) { return String(t).replace(/[•*#_>]/g,'').replace(/
 
 /* ============================================================
    VOICE — Web Speech API (recognition + synthesis)
+   Tuned for a natural, human-sounding delivery.
    ============================================================ */
-let recognition = null, isListening = false, idVoice = null;
+let recognition = null, isListening = false;
+let allVoices = [];        // all voices available in the browser
+let selectedVoice = null;  // the chosen voice object
+
+// Names that indicate high-quality / neural / natural voices per platform
+const GOOD_VOICE_HINTS = ['natural','neural','online','google','microsoft','premium','enhanced','wavenet','journey','damayanti','andika','arif','gadis'];
+
 function initSpeech() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (SR) {
@@ -1183,34 +1192,128 @@ function initSpeech() {
     recognition.onerror = (e) => { isListening = false; document.getElementById('micBtn').classList.remove('listening'); setStatus('Siap membantu'); if (e.error === 'not-allowed') botSay('Izin mikrofon ditolak. Aktifkan izin mikrofon di browser untuk memakai perintah suara.', false); };
     recognition.onresult = (e) => { const transcript = e.results[0][0].transcript; handleUserMessage(transcript); };
   }
-  // load voices for synthesis
   if ('speechSynthesis' in window) {
-    const loadVoices = () => {
-      const voices = speechSynthesis.getVoices();
-      idVoice = voices.find(v => /id[-_]ID/i.test(v.lang)) || voices.find(v => /indonesia/i.test(v.name)) || null;
-    };
     loadVoices();
     speechSynthesis.onvoiceschanged = loadVoices;
   }
 }
+
+function scoreVoice(v) {
+  // Higher = more natural / more preferred. Prioritise Indonesian, then quality hints.
+  let score = 0;
+  const name = (v.name || '').toLowerCase();
+  const lang = (v.lang || '').toLowerCase();
+  if (/id[-_]?id/.test(lang) || /indonesia/.test(name)) score += 100;
+  else if (lang.startsWith('id')) score += 80;
+  else if (lang.startsWith('en')) score += 10; // fallback readable
+  GOOD_VOICE_HINTS.forEach(h => { if (name.includes(h)) score += 12; });
+  if (name.includes('natural') || name.includes('neural') || name.includes('wavenet')) score += 25;
+  if (v.localService === false) score += 8; // cloud voices usually higher quality
+  // de-prioritise obviously robotic built-ins
+  if (name.includes('espeak') || name.includes('compact')) score -= 30;
+  return score;
+}
+
+function loadVoices() {
+  allVoices = (speechSynthesis.getVoices() || []).slice();
+  // pick user-selected voice if still available, else the best-scoring one
+  if (state.settings.voiceURI) {
+    selectedVoice = allVoices.find(v => v.voiceURI === state.settings.voiceURI) || null;
+  }
+  if (!selectedVoice && allVoices.length) {
+    selectedVoice = allVoices.slice().sort((a, b) => scoreVoice(b) - scoreVoice(a))[0];
+  }
+  populateVoiceSelect();
+}
+
+function populateVoiceSelect() {
+  const sel = document.getElementById('voiceSelect');
+  if (!sel) return;
+  // sort: Indonesian & high-quality first
+  const sorted = allVoices.slice().sort((a, b) => scoreVoice(b) - scoreVoice(a));
+  sel.innerHTML = '<option value="">Otomatis (pilih terbaik)</option>' + sorted.map(v => {
+    const flag = /id/i.test(v.lang) ? '🇮🇩 ' : '';
+    const quality = GOOD_VOICE_HINTS.some(h => (v.name||'').toLowerCase().includes(h)) ? ' ⭐' : '';
+    return `<option value="${escapeHtml(v.voiceURI)}">${flag}${escapeHtml(v.name)} (${escapeHtml(v.lang)})${quality}</option>`;
+  }).join('');
+  sel.value = state.settings.voiceURI || '';
+}
+
 function toggleListening() {
   if (!recognition) { botSay('Maaf, browser Anda belum mendukung input suara. Coba gunakan Google Chrome terbaru. Anda tetap bisa mengetik. 🙂', false); return; }
   if (isListening) stopListening(); else { try { recognition.start(); } catch(e){} }
 }
 function stopListening() { if (recognition && isListening) { try { recognition.stop(); } catch(e){} } }
+
+/* Split text into natural clauses so the synthesizer breathes between them
+   instead of reading one long flat monotone line. */
+function splitSpeechChunks(text) {
+  return String(text)
+    .replace(/\s+/g, ' ')
+    .split(/(?<=[.!?,:;])\s+/)
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
 function speakText(text) {
   if (!('speechSynthesis' in window) || !state.settings.voiceReply) return;
   speechSynthesis.cancel();
-  const u = new SpeechSynthesisUtterance(text);
-  u.lang = 'id-ID'; if (idVoice) u.voice = idVoice; u.rate = 1.02; u.pitch = 1;
-  speechSynthesis.speak(u);
+  if (!selectedVoice) loadVoices();
+  const rate = Number(state.settings.rate) || 0.98;
+  const pitch = Number(state.settings.pitch) || 1.0;
+  const chunks = splitSpeechChunks(text);
+  chunks.forEach((chunk, i) => {
+    const u = new SpeechSynthesisUtterance(chunk);
+    if (selectedVoice) { u.voice = selectedVoice; u.lang = selectedVoice.lang; }
+    else u.lang = 'id-ID';
+    // slight, human-like variation in pace & pitch per clause
+    u.rate = Math.max(0.6, Math.min(1.4, rate + (i % 2 === 0 ? 0 : -0.02)));
+    u.pitch = Math.max(0.5, Math.min(1.5, pitch + (Math.sin(i) * 0.03)));
+    u.volume = 1;
+    speechSynthesis.speak(u);
+  });
 }
+
 function setStatus(s) { document.getElementById('assistantStatus').textContent = s; }
 function updateVoiceToggle() {
   const btn = document.getElementById('voiceReplyToggle');
   btn.textContent = state.settings.voiceReply ? '🔊' : '🔇';
   btn.classList.toggle('muted', !state.settings.voiceReply);
   btn.title = state.settings.voiceReply ? 'Balasan suara: AKTIF' : 'Balasan suara: MATI';
+}
+
+/* ---- Bot name + settings panel ---- */
+function botName() { return (state.settings.botName || 'FinBot').trim() || 'FinBot'; }
+function applyBotIdentity() {
+  const name = botName();
+  const nameEl = document.getElementById('assistantNameLabel');
+  if (nameEl) nameEl.textContent = name;
+  const avatar = document.getElementById('assistantAvatar');
+  if (avatar) avatar.textContent = name.charAt(0).toUpperCase();
+  const launch = document.querySelector('#assistantLaunch .al-text strong');
+  if (launch) launch.textContent = name;
+}
+function openBotSettings() {
+  document.getElementById('botNameInput').value = state.settings.botName || '';
+  document.getElementById('rateSlider').value = state.settings.rate || 0.98;
+  document.getElementById('pitchSlider').value = state.settings.pitch || 1.0;
+  document.getElementById('rateValue').textContent = (Number(state.settings.rate)||0.98).toFixed(2) + '×';
+  document.getElementById('pitchValue').textContent = (Number(state.settings.pitch)||1.0).toFixed(2);
+  populateVoiceSelect();
+  document.getElementById('assistantSettings').classList.toggle('open');
+}
+function saveBotSettings() {
+  const name = document.getElementById('botNameInput').value.trim();
+  state.settings.botName = name || 'FinBot';
+  state.settings.voiceURI = document.getElementById('voiceSelect').value;
+  state.settings.rate = Number(document.getElementById('rateSlider').value);
+  state.settings.pitch = Number(document.getElementById('pitchSlider').value);
+  selectedVoice = state.settings.voiceURI ? (allVoices.find(v => v.voiceURI === state.settings.voiceURI) || selectedVoice) : allVoices.slice().sort((a,b)=>scoreVoice(b)-scoreVoice(a))[0];
+  save();
+  applyBotIdentity();
+  document.getElementById('assistantSettings').classList.remove('open');
+  toast('Pengaturan asisten disimpan ✓', 'success');
+  botSay(`Baik, mulai sekarang panggil saya ${botName()}. Ada yang bisa saya bantu? 😊`, true);
 }
 
 /* ============================================================
@@ -1226,6 +1329,7 @@ function init() {
   document.getElementById('sidebarDate').textContent = '📅 ' + dstr;
   refreshCategoryDropdown();
   updateVoiceToggle();
+  applyBotIdentity();
   initSpeech();
 
   // Navigation (event delegation for dynamic [data-page] too)
@@ -1321,6 +1425,24 @@ function init() {
   document.getElementById('micBtn').addEventListener('click', toggleListening);
   document.getElementById('voiceReplyToggle').addEventListener('click', () => { state.settings.voiceReply = !state.settings.voiceReply; save(); updateVoiceToggle(); if (!state.settings.voiceReply && 'speechSynthesis' in window) speechSynthesis.cancel(); });
   document.getElementById('assistantSuggestions').addEventListener('click', (e) => { const chip = e.target.closest('.suggestion-chip'); if (chip) handleUserMessage(chip.textContent); });
+
+  // Assistant settings (name + voice)
+  document.getElementById('assistantSettingsBtn').addEventListener('click', openBotSettings);
+  document.getElementById('saveBotSettings').addEventListener('click', saveBotSettings);
+  document.getElementById('rateSlider').addEventListener('input', (e) => { document.getElementById('rateValue').textContent = Number(e.target.value).toFixed(2) + '×'; });
+  document.getElementById('pitchSlider').addEventListener('input', (e) => { document.getElementById('pitchValue').textContent = Number(e.target.value).toFixed(2); });
+  document.getElementById('voiceSelect').addEventListener('change', (e) => { selectedVoice = allVoices.find(v => v.voiceURI === e.target.value) || selectedVoice; });
+  document.getElementById('testVoiceBtn').addEventListener('click', () => {
+    // apply current (unsaved) slider/voice values for the preview
+    const prevRate = state.settings.rate, prevPitch = state.settings.pitch, prevReply = state.settings.voiceReply;
+    state.settings.rate = Number(document.getElementById('rateSlider').value);
+    state.settings.pitch = Number(document.getElementById('pitchSlider').value);
+    state.settings.voiceReply = true;
+    selectedVoice = allVoices.find(v => v.voiceURI === document.getElementById('voiceSelect').value) || selectedVoice;
+    const testName = document.getElementById('botNameInput').value.trim() || botName();
+    speakText(`Halo, saya ${testName}. Beginilah suara saya membacakan laporan keuangan Anda.`);
+    state.settings.rate = prevRate; state.settings.pitch = prevPitch; state.settings.voiceReply = prevReply;
+  });
 
   // Re-render charts on resize
   let rzTimer;
