@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FinTrack — Pencatat Finansial Harian</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- ===== SIDEBAR ===== -->
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-header">
+    <div class="logo">
+      <span class="logo-icon">💰</span>
+      <span class="logo-text">FinTrack</span>
+    </div>
+    <button class="sidebar-close" id="sidebarClose">✕</button>
+  </div>
+  <nav class="sidebar-nav">
+    <a href="#" class="nav-item active" data-page="dashboard">
+      <span class="nav-icon">🏠</span><span>Dashboard</span>
+    </a>
+    <a href="#" class="nav-item" data-page="transactions">
+      <span class="nav-icon">📋</span><span>Transaksi</span>
+    </a>
+    <a href="#" class="nav-item" data-page="debts">
+      <span class="nav-icon">🤝</span><span>Hutang & Piutang</span>
+    </a>
+    <a href="#" class="nav-item" data-page="accounts">
+      <span class="nav-icon">🏦</span><span>Akun & Saldo</span>
+    </a>
+    <a href="#" class="nav-item" data-page="budget">
+      <span class="nav-icon">🎯</span><span>Anggaran & Tujuan</span>
+    </a>
+  </nav>
+  <div class="sidebar-footer">
+    <div class="sidebar-date" id="sidebarDate"></div>
+  </div>
+</aside>
+
+<!-- ===== OVERLAY ===== -->
+<div class="overlay" id="overlay"></div>
+
+<!-- ===== MAIN CONTENT ===== -->
+<div class="main-wrapper">
+  <!-- Top Bar -->
+  <header class="topbar">
+    <button class="menu-btn" id="menuBtn">☰</button>
+    <h1 class="page-title" id="pageTitle">Dashboard</h1>
+    <div class="topbar-right">
+      <span class="today-badge" id="todayBadge"></span>
+    </div>
+  </header>
+
+  <!-- Pages -->
+  <main class="content">
+
+    <!-- =================== DASHBOARD =================== -->
+    <section class="page active" id="page-dashboard">
+      <!-- Balance Cards -->
+      <div class="balance-grid">
+        <div class="balance-card primary">
+          <div class="balance-label">Total Saldo Bersih</div>
+          <div class="balance-amount" id="netBalance">Rp 0</div>
+          <div class="balance-sub">Sudah termasuk hutang & piutang</div>
+        </div>
+        <div class="balance-card clean">
+          <div class="balance-label">Saldo Murni</div>
+          <div class="balance-amount" id="cleanBalance">Rp 0</div>
+          <div class="balance-sub">Belum termasuk hutang & piutang</div>
+        </div>
+      </div>
+
+      <!-- Stat Row -->
+      <div class="stat-row">
+        <div class="stat-card income">
+          <div class="stat-icon">⬆️</div>
+          <div>
+            <div class="stat-label">Pemasukan Bulan Ini</div>
+            <div class="stat-val" id="monthlyIncome">Rp 0</div>
+          </div>
+        </div>
+        <div class="stat-card expense">
+          <div class="stat-icon">⬇️</div>
+          <div>
+            <div class="stat-label">Pengeluaran Bulan Ini</div>
+            <div class="stat-val" id="monthlyExpense">Rp 0</div>
+          </div>
+        </div>
+        <div class="stat-card debt">
+          <div class="stat-icon">📤</div>
+          <div>
+            <div class="stat-label">Total Hutang Aktif</div>
+            <div class="stat-val" id="totalDebt">Rp 0</div>
+          </div>
+        </div>
+        <div class="stat-card receivable">
+          <div class="stat-icon">📥</div>
+          <div>
+            <div class="stat-label">Total Piutang Aktif</div>
+            <div class="stat-val" id="totalReceivable">Rp 0</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Accounts Summary -->
+      <div class="section-header">
+        <h2 class="section-title">Ringkasan Akun</h2>
+        <button class="btn-link" data-page="accounts">Lihat Semua →</button>
+      </div>
+      <div class="accounts-summary-list" id="accountsSummary">
+        <div class="empty-hint">Belum ada akun. <span class="link" data-page="accounts">Tambah akun</span></div>
+      </div>
+
+      <!-- Quick Add Transaction -->
+      <div class="section-header" style="margin-top:24px">
+        <h2 class="section-title">Tambah Transaksi Cepat</h2>
+      </div>
+      <div class="quick-add-card">
+        <div class="quick-type-tabs">
+          <button class="qtab active" data-type="income">⬆️ Pemasukan</button>
+          <button class="qtab" data-type="expense">⬇️ Pengeluaran</button>
+        </div>
+        <div class="quick-form">
+          <div class="form-row">
+            <div class="form-group">
+              <label>Jumlah (Rp)</label>
+              <input type="number" id="qAmount" placeholder="0" min="0" />
+            </div>
+            <div class="form-group">
+              <label>Kategori</label>
+              <select id="qCategory">
+                <option value="">— Pilih —</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Dari / Ke Akun</label>
+              <select id="qAccount">
+                <option value="">— Pilih Akun —</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Tanggal</label>
+              <input type="date" id="qDate" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Catatan (opsional)</label>
+            <input type="text" id="qNote" placeholder="Contoh: makan siang, bayar listrik..." />
+          </div>
+          <button class="btn-primary full-width" id="qAddBtn">+ Simpan Transaksi</button>
+        </div>
+      </div>
+
+      <!-- Recent Transactions -->
+      <div class="section-header" style="margin-top:24px">
+        <h2 class="section-title">Transaksi Terakhir</h2>
+        <button class="btn-link" data-page="transactions">Lihat Semua →</button>
+      </div>
+      <div class="transaction-list" id="recentTxList">
+        <div class="empty-state">Belum ada transaksi hari ini.</div>
+      </div>
+    </section>
+
+    <!-- =================== TRANSACTIONS =================== -->
+    <section class="page" id="page-transactions">
+      <div class="filter-bar">
+        <select id="txFilterMonth" class="filter-select"></select>
+        <select id="txFilterType" class="filter-select">
+          <option value="">Semua Jenis</option>
+          <option value="income">Pemasukan</option>
+          <option value="expense">Pengeluaran</option>
+          <option value="debt_payment">Bayar Hutang</option>
+          <option value="receivable_payment">Terima Piutang</option>
+        </select>
+        <select id="txFilterAccount" class="filter-select">
+          <option value="">Semua Akun</option>
+        </select>
+      </div>
+
+      <div class="tx-summary-bar">
+        <span class="tx-sum-item income-text">⬆️ <span id="txSumIncome">Rp 0</span></span>
+        <span class="tx-sum-item expense-text">⬇️ <span id="txSumExpense">Rp 0</span></span>
+        <span class="tx-sum-item">Net: <strong id="txSumNet">Rp 0</strong></span>
+      </div>
+
+      <div class="transaction-list full" id="txFullList">
+        <div class="empty-state">Belum ada transaksi.</div>
+      </div>
+    </section>
+
+    <!-- =================== DEBTS & RECEIVABLES =================== -->
+    <section class="page" id="page-debts">
+      <div class="debt-tabs">
+        <button class="dtab active" data-debt="debt">🔴 Hutang Saya</button>
+        <button class="dtab" data-debt="receivable">🟢 Piutang Saya</button>
+      </div>
+
+      <!-- Add Debt/Receivable Form -->
+      <div class="add-debt-card" id="addDebtCard">
+        <div class="add-debt-header" id="addDebtHeader">
+          <span id="addDebtTitle">➕ Tambah Hutang Baru</span>
+          <button class="toggle-form-btn" id="toggleDebtForm">▼</button>
+        </div>
+        <div class="add-debt-body" id="addDebtBody">
+          <div class="form-row">
+            <div class="form-group">
+              <label id="debtPersonLabel">Nama Kreditur (yang meminjamkan)</label>
+              <input type="text" id="debtPerson" placeholder="Nama orang / institusi" />
+            </div>
+            <div class="form-group">
+              <label>Jumlah (Rp)</label>
+              <input type="number" id="debtAmount" placeholder="0" min="0" />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Tanggal Mulai</label>
+              <input type="date" id="debtDate" />
+            </div>
+            <div class="form-group">
+              <label>Jatuh Tempo (opsional)</label>
+              <input type="date" id="debtDue" />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Bunga / Cicilan (opsional)</label>
+              <input type="number" id="debtInterest" placeholder="% per bulan" min="0" step="0.1" />
+            </div>
+            <div class="form-group">
+              <label>Prioritas</label>
+              <select id="debtPriority">
+                <option value="normal">Normal</option>
+                <option value="high">🔥 Tinggi</option>
+                <option value="low">🟡 Rendah</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Catatan</label>
+            <input type="text" id="debtNote" placeholder="Konteks, tujuan pinjaman..." />
+          </div>
+          <button class="btn-primary full-width" id="addDebtBtn">+ Simpan</button>
+        </div>
+      </div>
+
+      <!-- Debt List -->
+      <div class="debt-list" id="debtList">
+        <div class="empty-state">Tidak ada hutang aktif. 🎉</div>
+      </div>
+    </section>
+
+    <!-- =================== ACCOUNTS =================== -->
+    <section class="page" id="page-accounts">
+      <!-- Total Cards -->
+      <div class="balance-grid">
+        <div class="balance-card primary">
+          <div class="balance-label">Total Saldo Semua Akun</div>
+          <div class="balance-amount" id="totalAccountBalance">Rp 0</div>
+          <div class="balance-sub">Saldo murni dari semua akun</div>
+        </div>
+        <div class="balance-card clean">
+          <div class="balance-label">Saldo + Piutang − Hutang</div>
+          <div class="balance-amount" id="totalAccountBalanceNet">Rp 0</div>
+          <div class="balance-sub">Sudah diperhitungkan hutang & piutang</div>
+        </div>
+      </div>
+
+      <!-- Add Account -->
+      <div class="add-debt-card">
+        <div class="add-debt-header" id="addAccountHeader">
+          <span>➕ Tambah / Edit Akun</span>
+          <button class="toggle-form-btn" id="toggleAccountForm">▼</button>
+        </div>
+        <div class="add-debt-body" id="addAccountBody">
+          <div class="form-row">
+            <div class="form-group">
+              <label>Nama Akun</label>
+              <input type="text" id="accName" placeholder="Contoh: BCA, Dana, Cash" />
+            </div>
+            <div class="form-group">
+              <label>Tipe</label>
+              <select id="accType">
+                <option value="bank">🏦 Bank</option>
+                <option value="cash">💵 Cash / Tunai</option>
+                <option value="ewallet">📱 E-Wallet</option>
+                <option value="investment">📈 Investasi</option>
+                <option value="other">📦 Lainnya</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Saldo Awal (Rp)</label>
+              <input type="number" id="accBalance" placeholder="0" min="0" />
+            </div>
+            <div class="form-group">
+              <label>Warna Akun</label>
+              <input type="color" id="accColor" value="#6366f1" />
+            </div>
+          </div>
+          <input type="hidden" id="editAccountId" />
+          <button class="btn-primary full-width" id="saveAccountBtn">+ Simpan Akun</button>
+        </div>
+      </div>
+
+      <!-- Account Cards -->
+      <div class="accounts-grid" id="accountsGrid">
+        <div class="empty-state">Belum ada akun. Tambahkan akun Anda di atas.</div>
+      </div>
+    </section>
+
+    <!-- =================== BUDGET =================== -->
+    <section class="page" id="page-budget">
+      <div class="budget-month-bar">
+        <button class="btn-icon" id="budgetPrevMonth">◀</button>
+        <span id="budgetMonthLabel">Loading...</span>
+        <button class="btn-icon" id="budgetNextMonth">▶</button>
+      </div>
+
+      <!-- Budget Overview -->
+      <div class="budget-overview" id="budgetOverview"></div>
+
+      <!-- Add Budget -->
+      <div class="add-debt-card">
+        <div class="add-debt-header" id="addBudgetHeader">
+          <span>🎯 Atur Anggaran Kategori</span>
+          <button class="toggle-form-btn" id="toggleBudgetForm">▼</button>
+        </div>
+        <div class="add-debt-body" id="addBudgetBody">
+          <div class="form-row">
+            <div class="form-group">
+              <label>Kategori</label>
+              <select id="budgetCategory"></select>
+            </div>
+            <div class="form-group">
+              <label>Limit Anggaran (Rp)</label>
+              <input type="number" id="budgetLimit" placeholder="0" min="0" />
+            </div>
+          </div>
+          <button class="btn-primary full-width" id="saveBudgetBtn">Simpan Anggaran</button>
+        </div>
+      </div>
+
+      <!-- Budget Detail -->
+      <div class="section-header">
+        <h2 class="section-title">Detail Per Kategori</h2>
+      </div>
+      <div class="budget-list" id="budgetList">
+        <div class="empty-state">Belum ada anggaran yang diatur.</div>
+      </div>
+
+      <!-- Goals -->
+      <div class="section-header" style="margin-top:24px">
+        <h2 class="section-title">🏆 Tujuan Tabungan</h2>
+      </div>
+      <div class="add-debt-card">
+        <div class="add-debt-header" id="addGoalHeader">
+          <span>➕ Tambah Tujuan Tabungan</span>
+          <button class="toggle-form-btn" id="toggleGoalForm">▼</button>
+        </div>
+        <div class="add-debt-body" id="addGoalBody">
+          <div class="form-row">
+            <div class="form-group">
+              <label>Nama Tujuan</label>
+              <input type="text" id="goalName" placeholder="Contoh: Liburan Bali, Laptop Baru" />
+            </div>
+            <div class="form-group">
+              <label>Target (Rp)</label>
+              <input type="number" id="goalTarget" placeholder="0" min="0" />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Sudah Terkumpul (Rp)</label>
+              <input type="number" id="goalSaved" placeholder="0" min="0" />
+            </div>
+            <div class="form-group">
+              <label>Target Tanggal</label>
+              <input type="date" id="goalDate" />
+            </div>
+          </div>
+          <button class="btn-primary full-width" id="addGoalBtn">+ Simpan Tujuan</button>
+        </div>
+      </div>
+      <div class="goals-list" id="goalsList">
+        <div class="empty-state">Belum ada tujuan tabungan.</div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- ===== MODALS ===== -->
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<!-- Mark Paid Modal -->
+<div class="modal-overlay" id="markPaidModal">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 id="markPaidTitle">Tandai Lunas</h3>
+      <button class="modal-close" id="closeMarkPaid">✕</button>
+    </div>
+    <div class="modal-body">
+      <p id="markPaidDesc"></p>
+      <div class="form-group">
+        <label>Uang <span id="markPaidDirection"></span> dari akun</label>
+        <select id="markPaidAccount">
+          <option value="">— Pilih Akun —</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Tanggal Pelunasan</label>
+        <input type="date" id="markPaidDate" />
+      </div>
+      <div class="form-group">
+        <label>Catatan (opsional)</label>
+        <input type="text" id="markPaidNote" placeholder="Catatan tambahan..." />
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" id="cancelMarkPaid">Batal</button>
+      <button class="btn-primary" id="confirmMarkPaid">✅ Konfirmasi Lunas</button>
+    </div>
+  </div>
+</div>
+
+<!-- Edit Debt Modal -->
+<div class="modal-overlay" id="editDebtModal">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 id="editDebtTitle">Edit Hutang / Piutang</h3>
+      <button class="modal-close" id="closeEditDebt">✕</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="editDebtId" />
+      <div class="form-row">
+        <div class="form-group">
+          <label id="editDebtPersonLabel">Nama</label>
+          <input type="text" id="editDebtPerson" />
+        </div>
+        <div class="form-group">
+          <label>Jumlah (Rp)</label>
+          <input type="number" id="editDebtAmount" min="0" />
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Tanggal Mulai</label>
+          <input type="date" id="editDebtDate" />
+        </div>
+        <div class="form-group">
+          <label>Jatuh Tempo</label>
+          <input type="date" id="editDebtDue" />
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Bunga % / Bulan</label>
+          <input type="number" id="editDebtInterest" min="0" step="0.1" />
+        </div>
+        <div class="form-group">
+          <label>Prioritas</label>
+          <select id="editDebtPriority">
+            <option value="normal">Normal</option>
+            <option value="high">🔥 Tinggi</option>
+            <option value="low">🟡 Rendah</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>Catatan</label>
+        <input type="text" id="editDebtNote" />
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" id="cancelEditDebt">Batal</button>
+      <button class="btn-primary" id="confirmEditDebt">💾 Simpan Perubahan</button>
+    </div>
+  </div>
+</div>
+
+<!-- Delete Confirm Modal -->
+<div class="modal-overlay" id="deleteModal">
+  <div class="modal modal-sm">
+    <div class="modal-header">
+      <h3>Hapus Data</h3>
+      <button class="modal-close" id="closeDelete">✕</button>
+    </div>
+    <div class="modal-body">
+      <p id="deleteMsg">Yakin ingin menghapus data ini? Tindakan ini tidak dapat dibatalkan.</p>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" id="cancelDelete">Batal</button>
+      <button class="btn-danger" id="confirmDelete">🗑️ Hapus</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
