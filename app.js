@@ -38,6 +38,8 @@ let state = {
   debts: [],
   budgets: [],
   goals: [],
+  learnedTerms: {},   // { "teazzi": "Minuman", ... } — things the user taught the bot
+  customCategories: [], // extra expense categories the user introduced while teaching
   settings: { voiceReply: true, botName: 'FinBot', voiceURI: '', rate: 0.98, pitch: 1.0, theme: 'light' }
 };
 const DEFAULT_SETTINGS = { voiceReply: true, botName: 'FinBot', voiceURI: '', rate: 0.98, pitch: 1.0, theme: 'light' };
@@ -62,6 +64,8 @@ function load() {
       state = Object.assign(state, parsed);
       // ensure all setting keys exist (backward compatible with older saves)
       state.settings = Object.assign({}, DEFAULT_SETTINGS, state.settings || {});
+      if (!state.learnedTerms || typeof state.learnedTerms !== 'object') state.learnedTerms = {};
+      if (!Array.isArray(state.customCategories)) state.customCategories = [];
     } catch (e) { console.error('Load error', e); }
   }
 }
@@ -937,8 +941,8 @@ function closeAssistant() {
   stopListening();
 }
 function greetAssistant() {
-  botSay(`Halo! 👋 Saya ${botName()}, asisten keuangan pribadi Anda. Saya bisa membantu Anda:\n\n• Mencatat pengeluaran/pemasukan cukup dengan bahasa biasa\n• Memberi rekap harian, mingguan, bulanan, tahunan\n• Menjawab pertanyaan soal keuangan Anda\n\nTekan ⚙️ untuk mengganti nama & suara saya. Coba ketik atau ucapkan sesuatu!`, false);
-  renderSuggestions(['Pengeluaran hari ini 15rb makan, 10rb parkir', 'Rekap bulan ini', 'Berapa saldo saya?', 'Hutang saya berapa?']);
+  botSay(`Halo! 👋 Saya ${botName()}, asisten keuangan pribadi Anda. Saya bisa membantu Anda:\n\n• Mencatat pengeluaran/pemasukan cukup dengan bahasa biasa\n• Memberi rekap harian, mingguan, bulanan, tahunan\n• Menjawab pertanyaan soal keuangan Anda\n• Belajar istilah baru dari Anda — contoh: "teazzi adalah minuman" 🧠\n\nTekan ⚙️ untuk mengganti nama & suara saya. Coba ketik atau ucapkan sesuatu!`, false);
+  renderSuggestions(['teazzi adalah minuman', 'Pengeluaran 15rb makan, 10rb parkir', 'Rekap bulan ini', 'Berapa saldo saya?']);
 }
 function renderSuggestions(arr) {
   document.getElementById('assistantSuggestions').innerHTML = arr.map(s => `<button class="suggestion-chip">${escapeHtml(s)}</button>`).join('');
@@ -993,9 +997,22 @@ function parseAmount(raw) {
 
 function autoCategory(text, isIncome) {
   const low = ' ' + text.toLowerCase() + ' ';
+
+  // 1) USER-TAUGHT TERMS take top priority (e.g. "teazzi" → "Minuman")
+  let bestLearned = null, bestLearnedLen = 0;
+  for (const [term, cat] of Object.entries(state.learnedTerms || {})) {
+    if (!term) continue;
+    const catIsIncome = isIncomeCategory(cat);
+    if (isIncome === true && !catIsIncome) continue;
+    if (isIncome === false && catIsIncome) continue;
+    const re = new RegExp('(^|\\W)' + term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(\\W|$)', 'i');
+    if (re.test(low) && term.length > bestLearnedLen) { bestLearned = cat; bestLearnedLen = term.length; }
+  }
+  if (bestLearned) return bestLearned;
+
+  // 2) Built-in keyword map
   let best = null, bestScore = 0;
   for (const [cat, kws] of Object.entries(CATEGORY_KEYWORDS)) {
-    // skip income categories when expense (and vice-versa) to avoid mismatches
     const catIsIncome = DEFAULT_CATEGORIES.income.includes(cat);
     if (isIncome === true && !catIsIncome) continue;
     if (isIncome === false && catIsIncome) continue;
@@ -1007,6 +1024,19 @@ function autoCategory(text, isIncome) {
   return best || 'Lainnya';
 }
 function isIncomeCategory(cat) { return DEFAULT_CATEGORIES.income.includes(cat); }
+// All expense categories = built-ins + user's custom ones
+function allExpenseCategories() {
+  return [...DEFAULT_CATEGORIES.expense.filter(c => c !== 'Lainnya'), ...(state.customCategories || []), 'Lainnya'];
+}
+// Normalize a category name the user typed (case-insensitive match to existing)
+function normalizeCategory(input) {
+  const t = input.trim();
+  const all = [...DEFAULT_CATEGORIES.expense, ...DEFAULT_CATEGORIES.income, ...(state.customCategories || [])];
+  const hit = all.find(c => c.toLowerCase() === t.toLowerCase());
+  if (hit) return hit;
+  // Title-case a new custom category
+  return t.replace(/\w\S*/g, w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase());
+}
 
 /* ---- pick the best amount token from a segment ----
    Prefers tokens that carry a unit (rb/ribu/k/jt/juta) or thousand separators,
@@ -1070,6 +1100,21 @@ function pickDefaultAccount() {
 function processCommand(text) {
   const low = text.toLowerCase();
 
+  // 0) TRAINING commands — check first so "teazzi adalah minuman" isn't parsed as a transaction
+
+  // List learned terms
+  if (/(daftar|lihat|apa saja|list).*(pelajaran|istilah|kata|yang.*(diajar|dilatih|kamu.*ingat))|apa.*(kamu|km).*(sudah|udah).*(pelajari|ingat|hafal)/.test(low)) {
+    return botListLearned();
+  }
+  // Forget a term: "lupakan teazzi" / "hapus istilah teazzi"
+  const forget = text.match(/(?:lupakan|hapus|forget|buang)\s+(?:istilah\s+|kata\s+)?["']?([\p{L}\p{N}\s]+?)["']?$/iu);
+  if (forget && /(lupakan|hapus|forget|buang)/i.test(low)) {
+    return botForgetTerm(forget[1].trim());
+  }
+  // Teach: "teazzi adalah minuman" / "teazzi itu kategori minuman" / "kalau beli teazzi masukkan ke minuman"
+  const taught = parseTeaching(text);
+  if (taught) return botLearnTerm(taught.term, taught.category);
+
   // 1) RECAP requests
   if (/(rekap|ringkas|laporan|summary|recap|rangkuman)/.test(low)) {
     let period = 'month';
@@ -1112,7 +1157,7 @@ function processCommand(text) {
 
   // 5) Help
   if (/(bantuan|help|apa yang bisa|fitur|cara pakai)/.test(low)) {
-    return botSay("Saya bisa membantu Anda:\n\n1. Mencatat transaksi — contoh: \"hari ini pengeluaran 20rb makan siang, 15rb bensin, 50rb belanja\"\n2. Rekap — contoh: \"rekap mingguan\" / \"rekap bulan ini\"\n3. Info saldo — \"berapa saldo saya?\"\n4. Info hutang/piutang — \"hutang saya berapa?\"\n\nAnda juga bisa menekan tombol mik 🎤 untuk bicara langsung.", false);
+    return botSay("Saya bisa membantu Anda:\n\n1. Mencatat transaksi — contoh: \"pengeluaran 20rb makan siang, 15rb bensin\"\n2. Rekap — \"rekap mingguan\" / \"rekap bulan ini\"\n3. Info saldo — \"berapa saldo saya?\"\n4. Info hutang/piutang — \"hutang saya berapa?\"\n5. Melatih saya — \"teazzi adalah minuman\", lalu \"lihat pelajaran\" untuk daftar, atau \"lupakan teazzi\" untuk hapus.\n\nAnda juga bisa menekan tombol mik 🎤 untuk bicara langsung.", false);
   }
 
   // 6) TRANSACTION parsing (has numbers → likely a record)
@@ -1133,6 +1178,75 @@ function processCommand(text) {
 
 /* ---- pick a random variant so replies don't feel robotic ---- */
 function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+/* ============================================================
+   TRAINING — teach the bot custom term → category mappings
+   ============================================================ */
+// Recognizes patterns like:
+//   "teazzi adalah minuman"           → term=teazzi, category=Minuman
+//   "teazzi itu kategori minuman"
+//   "teazzi termasuk minuman"
+//   "kalau (beli) teazzi masukin ke minuman"
+//   "anggap teazzi sebagai minuman"
+function parseTeaching(text) {
+  const t = text.trim();
+  // Guard: don't treat sentences containing amounts as teaching
+  if (/\d/.test(t) && /(rb|ribu|jt|juta|k\b|\d{3,})/i.test(t)) return null;
+
+  const patterns = [
+    /^(?:kalau|kalo|jika|klo)?\s*(?:beli|membeli)?\s*["']?([\p{L}\p{N}\s'.-]+?)["']?\s+(?:itu|adalah|termasuk|masuk(?:in|kan)?(?:\s+ke)?|sebagai|masuk\s+kategori|kategori(?:nya)?|anggap\s+sebagai)\s+(?:kategori\s+)?["']?([\p{L}\s'&\/-]+?)["']?$/iu,
+    /^anggap\s+["']?([\p{L}\p{N}\s'.-]+?)["']?\s+(?:sebagai|itu|adalah)\s+(?:kategori\s+)?["']?([\p{L}\s'&\/-]+?)["']?$/iu
+  ];
+  for (const re of patterns) {
+    const m = t.match(re);
+    if (m) {
+      let term = m[1].trim().toLowerCase().replace(/\s+/g, ' ');
+      let cat = normalizeCategory(m[2].trim());
+      // strip common filler that shouldn't be a term
+      if (!term || term.length < 2 || term.length > 40) return null;
+      if (!cat || cat.length < 2) return null;
+      // avoid capturing verbs as terms
+      if (/^(saya|aku|ini|itu|dia|kamu)$/i.test(term)) return null;
+      return { term, category: cat };
+    }
+  }
+  return null;
+}
+
+function botLearnTerm(term, category) {
+  const isNewCat = ![...DEFAULT_CATEGORIES.expense, ...DEFAULT_CATEGORIES.income, ...(state.customCategories||[])]
+    .some(c => c.toLowerCase() === category.toLowerCase());
+  if (isNewCat) {
+    state.customCategories.push(category);
+    refreshCategoryDropdown();
+  }
+  const existed = state.learnedTerms[term];
+  state.learnedTerms[term] = category;
+  save();
+  const extra = isNewCat ? `\n\nSaya juga menambahkan "${category}" sebagai kategori baru.` : '';
+  const verb = existed ? `Diperbarui! Sekarang` : `Siap, sudah saya catat!`;
+  botSay(`${verb} setiap kali Anda menyebut "${term}", otomatis saya masukkan ke kategori ${category}. 🧠${extra}\n\nCoba ketik: "beli ${term} 20rb" — nanti saya kategorikan sendiri.`, true);
+}
+
+function botForgetTerm(term) {
+  const key = Object.keys(state.learnedTerms).find(k => k.toLowerCase() === term.toLowerCase());
+  if (!key) return botSay(`Saya belum pernah mempelajari istilah "${term}". 🤔`, true);
+  const cat = state.learnedTerms[key];
+  delete state.learnedTerms[key];
+  save();
+  botSay(`Oke, saya lupakan bahwa "${key}" itu kategori ${cat}. 👍`, true);
+}
+
+function botListLearned() {
+  const entries = Object.entries(state.learnedTerms || {});
+  if (entries.length === 0) {
+    return botSay(`Saya belum mempelajari istilah khusus apa pun. 😊\n\nAjari saya dengan mengetik, misalnya:\n"teazzi adalah minuman"\n\nNanti setiap kali Anda menyebut "teazzi", saya otomatis masukkan ke kategori Minuman.`, false);
+  }
+  let html = `<b>🧠 ${entries.length} istilah yang sudah saya pelajari:</b><div class="msg-table">`;
+  entries.forEach(([term, cat]) => { html += `<div class="msg-table-row"><span>"${escapeHtml(term)}"</span><span>${escapeHtml(cat)}</span></div>`; });
+  html += `</div><div style="margin-top:6px;color:var(--muted);font-size:12px">Untuk menghapus: ketik "lupakan &lt;istilah&gt;".</div>`;
+  botSay(`Berikut ${entries.length} istilah yang sudah saya pelajari.`, false, html);
+}
 
 /* ---- conversational layer: greetings, small talk, identity, thanks ---- */
 function chitChat(text) {
@@ -1285,50 +1399,75 @@ const SILENCE_MS = 3000;           // wait 3s of silence before responding
 // Names that indicate high-quality / neural / natural voices per platform
 const GOOD_VOICE_HINTS = ['natural','neural','online','google','microsoft','premium','enhanced','wavenet','journey','damayanti','andika','arif','gadis'];
 
+// Detect mobile — Web Speech behaves very differently there.
+const IS_MOBILE = /Android|iPhone|iPad|iPod|Opera Mini|IEMobile|Mobile/i.test(navigator.userAgent || '');
+let restartAttempts = 0;             // guard against rapid restart loops on mobile
+let lastSpeechAt = 0;                // timestamp of last recognized speech
+
 function initSpeech() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (SR) {
     recognition = new SR();
     recognition.lang = 'id-ID';
-    recognition.continuous = true;       // keep listening through pauses
-    recognition.interimResults = true;   // so we can detect ongoing speech
-    recognition.maxAlternatives = 1;
+    // On mobile, continuous mode is unreliable (engine stops after each phrase).
+    // We keep it non-continuous there and rebuild continuity via smart restart.
+    recognition.continuous = !IS_MOBILE;
+    recognition.interimResults = true;   // needed to show live feedback & detect speech
+    recognition.maxAlternatives = 3;     // more candidates → better accuracy
 
     recognition.onstart = () => {
-      isListening = true; manualStop = false; voiceFinalTranscript = '';
+      isListening = true; manualStop = false;
+      restartAttempts = 0;
       document.getElementById('micBtn').classList.add('listening');
-      setStatus('Mendengarkan… (bicara santai, saya menunggu)');
+      setStatus(IS_MOBILE ? 'Mendengarkan… bicara sekarang' : 'Mendengarkan… (bicara santai, saya menunggu)');
     };
 
+    recognition.onspeechstart = () => { lastSpeechAt = Date.now(); };
+
     recognition.onresult = (e) => {
-      // rebuild finalized + interim text
+      lastSpeechAt = Date.now();
+      restartAttempts = 0; // real speech arrived → reset restart guard
       let interim = '';
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const res = e.results[i];
-        if (res.isFinal) voiceFinalTranscript += res[0].transcript + ' ';
-        else interim += res[0].transcript;
+        if (res.isFinal) {
+          // choose the best non-empty alternative
+          let chosen = res[0].transcript;
+          for (let a = 0; a < res.length; a++) { if (res[a].transcript && res[a].transcript.trim()) { chosen = res[a].transcript; break; } }
+          voiceFinalTranscript += chosen + ' ';
+        } else {
+          interim += res[0].transcript;
+        }
       }
       const preview = (voiceFinalTranscript + interim).trim();
-      if (preview) {
-        setStatus('Saya dengar: "' + (preview.length > 40 ? preview.slice(0, 40) + '…' : preview) + '"');
-      }
-      // reset the 5s silence countdown every time new speech arrives
+      if (preview) setStatus('Saya dengar: "' + (preview.length > 40 ? preview.slice(0, 40) + '…' : preview) + '"');
       scheduleSilenceFinalize();
     };
 
     recognition.onerror = (e) => {
-      if (e.error === 'no-speech') { return; } // ignore; keep waiting patiently
-      isListening = false; clearTimeout(silenceTimer);
+      // Non-fatal errors on mobile — keep going.
+      if (e.error === 'no-speech' || e.error === 'aborted') return;
+      if (e.error === 'network') { setStatus('Koneksi lemah, mencoba lagi…'); return; }
+      clearTimeout(silenceTimer);
+      isListening = false;
       document.getElementById('micBtn').classList.remove('listening'); setStatus('Siap membantu');
-      if (e.error === 'not-allowed' || e.error === 'service-not-allowed')
-        botSay('Izin mikrofon ditolak. Aktifkan izin mikrofon di browser untuk memakai perintah suara. 🙂', false);
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+        botSay('Sepertinya izin mikrofon belum aktif. 🎤\n\nDi HP: buka pengaturan situs di browser (ikon 🔒 di address bar) → izinkan Mikrofon, lalu coba lagi. Pastikan juga membuka lewat HTTPS.', false);
+      }
     };
 
     recognition.onend = () => {
-      // The engine may auto-stop; if the user hasn't finished and didn't tap stop,
-      // restart so pauses for thinking don't cut them off.
+      // If the user didn't tap stop and we're still supposed to listen,
+      // restart the engine (with a small guard to avoid tight loops on mobile).
       if (isListening && !manualStop) {
-        try { recognition.start(); return; } catch (e) { /* fallthrough */ }
+        const quietFor = Date.now() - lastSpeechAt;
+        // If they've been silent past the threshold, finalize instead of restarting.
+        if (lastSpeechAt && quietFor >= SILENCE_MS) { finalizeVoiceInput(false); return; }
+        if (restartAttempts < 8) {
+          restartAttempts++;
+          setTimeout(() => { try { recognition.start(); } catch (e) {} }, IS_MOBILE ? 250 : 100);
+          return;
+        }
       }
       isListening = false; clearTimeout(silenceTimer);
       document.getElementById('micBtn').classList.remove('listening'); setStatus('Siap membantu');
@@ -1382,9 +1521,19 @@ function populateVoiceSelect() {
 }
 
 function toggleListening() {
-  if (!recognition) { botSay('Maaf, browser Anda belum mendukung input suara. Coba gunakan Google Chrome terbaru. Anda tetap bisa mengetik. 🙂', false); return; }
-  if (isListening) { finalizeVoiceInput(true); }   // tapping mic = finish now
-  else { try { recognition.start(); } catch(e){} }
+  if (!recognition) { botSay('Maaf, browser Anda belum mendukung input suara. Coba gunakan Google Chrome terbaru (atau Safari di iPhone). Anda tetap bisa mengetik dengan nyaman. 🙂', false); return; }
+  if (isListening) { finalizeVoiceInput(true); return; }   // tapping mic while active = finish now
+  // Starting fresh: stop any ongoing TTS so the mic doesn't hear the bot itself.
+  if ('speechSynthesis' in window) { try { speechSynthesis.cancel(); } catch (e) {} }
+  voiceFinalTranscript = '';
+  manualStop = false;
+  restartAttempts = 0;
+  lastSpeechAt = 0;
+  try { recognition.start(); }
+  catch (e) {
+    // Some engines throw if start() is called too soon after a previous stop.
+    setTimeout(() => { try { recognition.start(); } catch (e2) {} }, 300);
+  }
 }
 function stopListening() {
   manualStop = true;
