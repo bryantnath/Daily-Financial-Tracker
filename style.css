@@ -510,6 +510,20 @@ input[type="color"] { height: 44px; padding: 4px; cursor: pointer; }
 .send-btn { background: var(--primary); color: #fff; }
 .send-btn:hover { background: var(--primary-dark); }
 
+/* Floating back-to-dashboard button (center-left of the assistant) */
+.assistant-back {
+  position: absolute; left: 12px; top: 50%; transform: translateY(-50%);
+  width: 44px; height: 44px; border-radius: 50%;
+  background: var(--surface); color: var(--primary);
+  border: 1px solid var(--line-strong); box-shadow: var(--shadow-md);
+  display: none; place-items: center; cursor: pointer; z-index: 20;
+  transition: all 0.18s;
+}
+.assistant-back:hover { background: var(--primary-soft); border-color: var(--primary); transform: translateY(-50%) scale(1.06); }
+.assistant-back:active { transform: translateY(-50%) scale(0.96); }
+/* Only show it when the assistant is open */
+.assistant.open .assistant-back { display: grid; }
+
 /* Assistant settings panel */
 .assistant-settings {
   display: none; padding: 16px 18px; background: var(--surface);

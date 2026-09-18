@@ -929,6 +929,9 @@ function openDelete(msg, action) {
    ============================================================ */
 const NUM_WORDS = { 'nol':0,'satu':1,'dua':2,'tiga':3,'empat':4,'lima':5,'enam':6,'tujuh':7,'delapan':8,'sembilan':9,'sepuluh':10,'sebelas':11,'seratus':100,'seribu':1000 };
 
+// When the bot has parsed a transaction but is waiting for the user to pick an account
+let pendingTx = null;   // { items:[...], isIncome:bool }
+
 function openAssistant() {
   document.getElementById('assistant').classList.add('open');
   document.getElementById('assistantOverlay').classList.add('show');
@@ -945,7 +948,12 @@ function greetAssistant() {
   renderSuggestions(['teazzi adalah minuman', 'Pengeluaran 15rb makan, 10rb parkir', 'Rekap bulan ini', 'Berapa saldo saya?']);
 }
 function renderSuggestions(arr) {
-  document.getElementById('assistantSuggestions').innerHTML = arr.map(s => `<button class="suggestion-chip">${escapeHtml(s)}</button>`).join('');
+  // items can be plain strings, or { label, account: id } for account-pick chips
+  document.getElementById('assistantSuggestions').innerHTML = arr.map(s => {
+    if (typeof s === 'string') return `<button class="suggestion-chip">${escapeHtml(s)}</button>`;
+    if (s.account) return `<button class="suggestion-chip acc-chip" data-account="${escapeHtml(s.account)}">${escapeHtml(s.label)}</button>`;
+    return `<button class="suggestion-chip">${escapeHtml(s.label)}</button>`;
+  }).join('');
 }
 function addMessage(text, who, html) {
   const cont = document.getElementById('assistantMessages');
@@ -1099,6 +1107,23 @@ function pickDefaultAccount() {
 /* ---- main command processor ---- */
 function processCommand(text) {
   const low = text.toLowerCase();
+
+  // -1) Waiting for the user to pick an account for a pending transaction?
+  if (pendingTx) {
+    if (/(batal|cancel|gak jadi|ga jadi|nggak jadi|tidak jadi|stop)/.test(low)) {
+      pendingTx = null;
+      renderSuggestions(defaultSuggestions());
+      return botSay('Oke, dibatalkan. Tidak ada yang saya catat. 👍', true);
+    }
+    const acc = resolveAccountFromText(text);
+    if (acc) return commitTransactions(acc.id);
+    // couldn't tell which account → re-ask with chips
+    botSay('Maaf, akun mana ya? Silakan pilih salah satu di bawah, atau sebut nama akunnya. 🙂', true);
+    const chips = state.accounts.map(a => ({ label: `${(ACC_TYPE[a.type]||ACC_TYPE.other).icon} ${a.name} · ${rp(a.balance)}`, account: a.id }));
+    chips.push({ label: '✕ Batal' });
+    renderSuggestions(chips);
+    return;
+  }
 
   // 0) TRAINING commands — check first so "teazzi adalah minuman" isn't parsed as a transaction
 
@@ -1316,16 +1341,47 @@ function chitChat(text) {
 }
 
 function botAddTransactions(items, isIncome) {
-  const acc = pickDefaultAccount();
-  if (!acc) {
-    return botSay('Anda belum punya akun. Silakan tambahkan akun dulu di menu "Akun & Saldo", lalu saya bisa mencatat transaksi Anda.', true);
+  if (state.accounts.length === 0) {
+    return botSay('Anda belum punya akun. Silakan tambahkan akun dulu di menu "Akun & Saldo", lalu saya bisa mencatat transaksi Anda. 😊', true);
   }
+  // Only one account? No need to ask — record straight away.
+  if (state.accounts.length === 1) {
+    return commitTransactions(state.accounts[0].id, items, isIncome);
+  }
+  // Otherwise, ask which account to use, showing balances.
+  pendingTx = { items, isIncome };
+  const total = items.reduce((s, it) => s + it.amount, 0);
+  const kindTxt = isIncome ? 'pemasukan' : 'pengeluaran';
+  const dir = isIncome ? 'masuk ke' : 'diambil dari';
+
+  // summary of the parsed items
+  let html = `<b>Siap mencatat ${items.length} ${kindTxt}</b> (total ${rp(total)}):<div class="msg-table">`;
+  items.forEach(it => { html += `<div class="msg-table-row"><span>${escapeHtml(it.desc)} <i style="color:var(--faint)">· ${escapeHtml(it.category)}</i></span><span>${rp(it.amount)}</span></div>`; });
+  html += `</div><div style="margin-top:8px">Uang ini ${dir} akun mana?</div>`;
+  botSay(`Siap mencatat ${items.length} ${kindTxt}, total ${rpSpeech(total)}. Uang ini ${dir} akun mana?`, false, html);
+  if (state.settings.voiceReply) speakText(`Baik. Uang ini ${dir} akun mana?`);
+
+  // account chips with live balances
+  const chips = state.accounts.map(a => ({
+    label: `${(ACC_TYPE[a.type]||ACC_TYPE.other).icon} ${a.name} · ${rp(a.balance)}`,
+    account: a.id
+  }));
+  chips.push({ label: '✕ Batal' });
+  renderSuggestions(chips);
+}
+
+// Commit the pending (or given) transactions to a chosen account
+function commitTransactions(accountId, items, isIncome) {
+  if (!items && pendingTx) { items = pendingTx.items; isIncome = pendingTx.isIncome; }
+  pendingTx = null;
+  const acc = accountById(accountId);
+  if (!acc || !items) { renderSuggestions(defaultSuggestions()); return; }
+
   let total = 0;
   const rows = [];
   items.forEach(it => {
     const type = isIncome ? 'income' : 'expense';
     let category = it.category;
-    // if income and category not an income one, fallback
     if (isIncome && !isIncomeCategory(category)) category = 'Lainnya';
     state.transactions.push({ id: uid(), type, amount: it.amount, category, accountId: acc.id, date: todayStr(), note: it.desc, createdAt: Date.now() });
     acc.balance = Number(acc.balance) + (isIncome ? it.amount : -it.amount);
@@ -1337,11 +1393,31 @@ function botAddTransactions(items, isIncome) {
   const kindTxt = isIncome ? 'pemasukan' : 'pengeluaran';
   let html = `<b>✅ ${items.length} ${kindTxt} tercatat</b> (akun: ${escapeHtml(acc.name)})<div class="msg-table">`;
   rows.forEach(r => { html += `<div class="msg-table-row"><span>${escapeHtml(r.desc)} <i style="color:var(--faint)">· ${escapeHtml(r.category)}</i></span><span>${rp(r.amount)}</span></div>`; });
-  html += `<div class="msg-table-row total"><span>Total</span><span>${rp(total)}</span></div></div>`;
-  const speak = `${items.length} ${kindTxt} berhasil dicatat, total ${rpSpeech(total)}. Saldo ${acc.name} sekarang ${rpSpeech(acc.balance)}.`;
+  html += `<div class="msg-table-row total"><span>Total</span><span>${rp(total)}</span></div>`;
+  html += `<div class="msg-table-row"><span>Sisa saldo ${escapeHtml(acc.name)}</span><span>${rp(acc.balance)}</span></div></div>`;
+  const speak = `${items.length} ${kindTxt} berhasil dicatat di ${acc.name}, total ${rpSpeech(total)}. Sisa saldo ${acc.name} ${rpSpeech(acc.balance)}.`;
   botSay(speak, false, html);
   if (state.settings.voiceReply) speakText(speak);
-  renderSuggestions(['Rekap hari ini', 'Berapa saldo saya?', 'Rekap bulan ini']);
+  renderSuggestions(defaultSuggestions());
+}
+
+function defaultSuggestions() { return ['Rekap hari ini', 'Berapa saldo saya?', 'Rekap bulan ini']; }
+
+// Try to resolve a typed/spoken reply into one of the user's accounts.
+function resolveAccountFromText(text) {
+  const low = text.toLowerCase().trim();
+  // exact / contains match on account name
+  let hit = state.accounts.find(a => low === a.name.toLowerCase());
+  if (!hit) hit = state.accounts.find(a => low.includes(a.name.toLowerCase()) || a.name.toLowerCase().includes(low));
+  // match by type keyword (bank, cash/tunai, ewallet/e-wallet/dompet)
+  if (!hit) {
+    if (/(cash|tunai|kontan)/.test(low)) hit = state.accounts.find(a => a.type === 'cash');
+    else if (/(bank|rekening)/.test(low)) hit = state.accounts.find(a => a.type === 'bank');
+    else if (/(wallet|e-wallet|ewallet|dompet|dana|ovo|gopay|shopeepay)/.test(low)) hit = state.accounts.find(a => a.type === 'ewallet');
+  }
+  // match by order number "1", "2", ...
+  if (!hit) { const n = parseInt(low, 10); if (n >= 1 && n <= state.accounts.length) hit = state.accounts[n - 1]; }
+  return hit || null;
 }
 
 function botRecap(period) {
@@ -1758,12 +1834,30 @@ function init() {
   document.getElementById('assistantLaunch').addEventListener('click', openAssistant);
   document.getElementById('topbarAiBtn').addEventListener('click', openAssistant);
   document.getElementById('assistantClose').addEventListener('click', closeAssistant);
+  document.getElementById('assistantBack').addEventListener('click', () => { closeAssistant(); goToPage('dashboard'); });
   document.getElementById('assistantOverlay').addEventListener('click', closeAssistant);
   document.getElementById('assistantSend').addEventListener('click', () => handleUserMessage(document.getElementById('assistantInput').value));
   document.getElementById('assistantInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') handleUserMessage(e.target.value); });
   document.getElementById('micBtn').addEventListener('click', toggleListening);
   document.getElementById('voiceReplyToggle').addEventListener('click', () => { state.settings.voiceReply = !state.settings.voiceReply; save(); updateVoiceToggle(); if (!state.settings.voiceReply && 'speechSynthesis' in window) speechSynthesis.cancel(); });
-  document.getElementById('assistantSuggestions').addEventListener('click', (e) => { const chip = e.target.closest('.suggestion-chip'); if (chip) handleUserMessage(chip.textContent); });
+  document.getElementById('assistantSuggestions').addEventListener('click', (e) => {
+    const chip = e.target.closest('.suggestion-chip');
+    if (!chip) return;
+    // Account-pick chip → commit the pending transaction to that account
+    if (chip.dataset.account && pendingTx) {
+      const acc = accountById(chip.dataset.account);
+      addMessage(acc ? acc.name : chip.textContent, 'user');
+      renderSuggestions([]);
+      return commitTransactions(chip.dataset.account);
+    }
+    // "Batal" chip while a transaction is pending
+    if (pendingTx && /batal/i.test(chip.textContent)) {
+      addMessage(chip.textContent, 'user');
+      pendingTx = null; renderSuggestions(defaultSuggestions());
+      return botSay('Oke, dibatalkan. Tidak ada yang saya catat. 👍', true);
+    }
+    handleUserMessage(chip.textContent);
+  });
 
   // Assistant settings (name + voice)
   document.getElementById('assistantSettingsBtn').addEventListener('click', openBotSettings);
