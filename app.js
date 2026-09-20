@@ -186,7 +186,7 @@ function drawLineChart(canvasId, labels, series) {
   if (max === 0) max = 1;
   const niceMax = niceNumber(max);
   // grid + y labels
-  ctx.font = '11px "Plus Jakarta Sans", sans-serif';
+  ctx.font = '11px "Times New Roman", Georgia, serif';
   ctx.fillStyle = chartInk(); ctx.strokeStyle = chartGrid(); ctx.lineWidth = 1;
   const steps = 4;
   for (let i = 0; i <= steps; i++) {
@@ -239,7 +239,7 @@ function drawBarChart(canvasId, labels, values, colors) {
   const cw = w - padL - padR, ch = h - padT - padB;
   let max = Math.max(...values, 0); if (max === 0) max = 1;
   const niceMax = niceNumber(max);
-  ctx.font = '11px "Plus Jakarta Sans", sans-serif';
+  ctx.font = '11px "Times New Roman", Georgia, serif';
   ctx.strokeStyle = chartGrid(); ctx.fillStyle = chartInk();
   const steps = 4;
   for (let i = 0; i <= steps; i++) {
@@ -273,7 +273,7 @@ function drawDonutChart(canvasId, data) {
   if (total === 0) {
     ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.arc(cx, cy, inner, 0, Math.PI*2, true);
     ctx.fillStyle = chartGrid(); ctx.fill('evenodd');
-    ctx.fillStyle = chartInk(); ctx.font = '13px "Plus Jakarta Sans"'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = chartInk(); ctx.font = '13px "Times New Roman", Georgia, serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText('Belum ada data', cx, cy);
     return;
   }
@@ -287,9 +287,9 @@ function drawDonutChart(canvasId, data) {
   // inner hole
   ctx.beginPath(); ctx.arc(cx, cy, inner, 0, Math.PI*2); ctx.fillStyle = chartHole(); ctx.fill();
   // center text
-  ctx.fillStyle = chartCenterInk(); ctx.font = '800 18px "Plus Jakarta Sans"'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = chartCenterInk(); ctx.font = '800 18px "Times New Roman", Georgia, serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   ctx.fillText(rpShort(total), cx, cy - 6);
-  ctx.fillStyle = chartInk(); ctx.font = '600 11px "Plus Jakarta Sans"';
+  ctx.fillStyle = chartInk(); ctx.font = '600 11px "Times New Roman", Georgia, serif';
   ctx.fillText('Total', cx, cy + 12);
 }
 
