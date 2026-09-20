@@ -40,9 +40,10 @@ let state = {
   goals: [],
   learnedTerms: {},   // { "teazzi": "Minuman", ... } — things the user taught the bot
   customCategories: [], // extra expense categories the user introduced while teaching
-  settings: { voiceReply: true, botName: 'FinBot', voiceURI: '', rate: 0.98, pitch: 1.0, theme: 'light' }
+  auditLog: [],       // agent actions: {ts, userMessage, intent, action, toolCalls, result, confidence}
+  settings: { voiceReply: true, botName: 'FinBot', voiceURI: '', rate: 0.98, pitch: 1.0, theme: 'light', autoConfirm: 'smart' }
 };
-const DEFAULT_SETTINGS = { voiceReply: true, botName: 'FinBot', voiceURI: '', rate: 0.98, pitch: 1.0, theme: 'light' };
+const DEFAULT_SETTINGS = { voiceReply: true, botName: 'FinBot', voiceURI: '', rate: 0.98, pitch: 1.0, theme: 'light', autoConfirm: 'smart' };
 
 let ui = {
   quickType: 'income',
@@ -66,6 +67,7 @@ function load() {
       state.settings = Object.assign({}, DEFAULT_SETTINGS, state.settings || {});
       if (!state.learnedTerms || typeof state.learnedTerms !== 'object') state.learnedTerms = {};
       if (!Array.isArray(state.customCategories)) state.customCategories = [];
+      if (!Array.isArray(state.auditLog)) state.auditLog = [];
     } catch (e) { console.error('Load error', e); }
   }
 }
@@ -929,6 +931,188 @@ function openDelete(msg, action) {
    ============================================================ */
 const NUM_WORDS = { 'nol':0,'satu':1,'dua':2,'tiga':3,'empat':4,'lima':5,'enam':6,'tujuh':7,'delapan':8,'sembilan':9,'sepuluh':10,'sebelas':11,'seratus':100,'seribu':1000 };
 
+/* ============================================================
+   AGENT TOOL LAYER — the ONLY way the agent mutates data.
+   Every tool has typed params, validation, audit log, and
+   idempotency. The LLM/NLP layer never touches state directly.
+   ============================================================ */
+const recentToolKeys = new Map();   // idempotency: key -> timestamp
+const IDEMPOTENCY_WINDOW_MS = 4000; // ignore identical write within this window
+
+function auditRecord(entry) {
+  try {
+    state.auditLog.push(Object.assign({ ts: Date.now() }, entry));
+    // keep last 500 to bound storage
+    if (state.auditLog.length > 500) state.auditLog = state.auditLog.slice(-500);
+  } catch (e) { /* non-fatal */ }
+}
+
+function toolError(msg) { return { ok: false, error: msg }; }
+function toolOk(data) { return Object.assign({ ok: true }, data); }
+
+const AgentTools = {
+  /* ---------- READ tools ---------- */
+  get_accounts() { return toolOk({ accounts: state.accounts.map(a => ({ id: a.id, name: a.name, type: a.type, balance: Number(a.balance) })) }); },
+  get_categories() { return toolOk({ expense: allExpenseCategories(), income: DEFAULT_CATEGORIES.income.slice() }); },
+  get_balances() { return toolOk({ clean: cleanBalance(), net: netBalance(), debt: totalDebtActive(), receivable: totalReceivableActive() }); },
+  get_debts(p = {}) {
+    let list = state.debts.filter(d => d.kind === 'debt');
+    if (p.status) list = list.filter(d => d.status === p.status);
+    if (p.person) list = list.filter(d => d.person.toLowerCase().includes(String(p.person).toLowerCase()));
+    return toolOk({ debts: list });
+  },
+  get_receivables(p = {}) {
+    let list = state.debts.filter(d => d.kind === 'receivable');
+    if (p.status) list = list.filter(d => d.status === p.status);
+    if (p.person) list = list.filter(d => d.person.toLowerCase().includes(String(p.person).toLowerCase()));
+    return toolOk({ receivables: list });
+  },
+  search_transactions(p = {}) {
+    let list = state.transactions.slice();
+    if (p.type) list = list.filter(t => t.type === p.type);
+    if (p.category) list = list.filter(t => (t.category || '').toLowerCase() === String(p.category).toLowerCase());
+    if (p.accountId) list = list.filter(t => t.accountId === p.accountId);
+    if (p.month) list = list.filter(t => t.date.startsWith(p.month));
+    if (p.query) list = list.filter(t => ((t.note || '') + ' ' + (t.category || '')).toLowerCase().includes(String(p.query).toLowerCase()));
+    list.sort(sortByDateDesc);
+    if (p.limit) list = list.slice(0, p.limit);
+    return toolOk({ transactions: list });
+  },
+
+  /* ---------- WRITE tools ---------- */
+  // Create one expense/income transaction on an account.
+  create_transaction(p = {}) {
+    const amount = Number(p.amount);
+    if (!amount || amount <= 0) return toolError('Jumlah tidak valid');
+    if (!['income', 'expense'].includes(p.type)) return toolError('Jenis transaksi tidak valid');
+    const acc = accountById(p.accountId);
+    if (!acc) return toolError('Akun tidak ditemukan');
+
+    // idempotency guard
+    const key = `tx|${p.type}|${amount}|${p.accountId}|${p.category}|${p.note || ''}`;
+    const now = Date.now();
+    if (recentToolKeys.has(key) && now - recentToolKeys.get(key) < IDEMPOTENCY_WINDOW_MS)
+      return toolError('__duplicate__');
+    recentToolKeys.set(key, now);
+
+    const tx = { id: uid(), type: p.type, amount, category: p.category || 'Lainnya', accountId: acc.id, date: p.date || todayStr(), note: p.note || '', createdAt: now };
+    if (p.merchant) tx.merchant = p.merchant;
+    state.transactions.push(tx);
+    acc.balance = Number(acc.balance) + (p.type === 'income' ? amount : -amount);
+    auditRecord({ tool: 'create_transaction', params: { type: p.type, amount, accountId: acc.id, category: tx.category }, result: tx.id });
+    return toolOk({ id: tx.id, balanceAfter: acc.balance });
+  },
+
+  // Transfer between two accounts (net worth unchanged).
+  transfer(p = {}) {
+    const amount = Number(p.amount);
+    if (!amount || amount <= 0) return toolError('Jumlah tidak valid');
+    const from = accountById(p.fromId), to = accountById(p.toId);
+    if (!from || !to) return toolError('Akun tidak ditemukan');
+    if (from.id === to.id) return toolError('Akun asal dan tujuan sama');
+    const key = `tf|${amount}|${from.id}|${to.id}`;
+    const now = Date.now();
+    if (recentToolKeys.has(key) && now - recentToolKeys.get(key) < IDEMPOTENCY_WINDOW_MS) return toolError('__duplicate__');
+    recentToolKeys.set(key, now);
+
+    const date = p.date || todayStr();
+    const outTx = { id: uid(), type: 'expense', amount, category: 'Transfer', accountId: from.id, date, note: `Transfer ke ${to.name}`, createdAt: now, transfer: true };
+    const inTx = { id: uid(), type: 'income', amount, category: 'Transfer', accountId: to.id, date, note: `Transfer dari ${from.name}`, createdAt: now + 1, transfer: true, transferPair: outTx.id };
+    outTx.transferPair = inTx.id;
+    state.transactions.push(outTx, inTx);
+    from.balance = Number(from.balance) - amount;
+    to.balance = Number(to.balance) + amount;
+    auditRecord({ tool: 'transfer', params: { amount, fromId: from.id, toId: to.id }, result: [outTx.id, inTx.id] });
+    return toolOk({ fromBalance: from.balance, toBalance: to.balance });
+  },
+
+  // Create a debt (payable = you owe) or receivable (you are owed).
+  create_debt(p = {}) {
+    const amount = Number(p.amount);
+    if (!amount || amount <= 0) return toolError('Jumlah tidak valid');
+    if (!['debt', 'receivable'].includes(p.kind)) return toolError('Jenis tidak valid');
+    if (!p.person || !String(p.person).trim()) return toolError('Nama orang wajib diisi');
+    const key = `debt|${p.kind}|${amount}|${String(p.person).toLowerCase()}`;
+    const now = Date.now();
+    if (recentToolKeys.has(key) && now - recentToolKeys.get(key) < IDEMPOTENCY_WINDOW_MS) return toolError('__duplicate__');
+    recentToolKeys.set(key, now);
+
+    const d = { id: uid(), kind: p.kind, person: String(p.person).trim(), amount, date: p.date || todayStr(), due: p.due || '', interest: 0, priority: 'normal', note: p.note || '', status: 'active', createdAt: now };
+    state.debts.push(d);
+    auditRecord({ tool: 'create_debt', params: { kind: p.kind, amount, person: d.person }, result: d.id });
+    return toolOk({ id: d.id });
+  },
+
+  // Record a (possibly partial) repayment against an existing active debt/receivable.
+  record_payment(p = {}) {
+    const amount = Number(p.amount);
+    if (!amount || amount <= 0) return toolError('Jumlah tidak valid');
+    const d = state.debts.find(x => x.id === p.debtId && x.status === 'active');
+    if (!d) return toolError('Hutang/piutang tidak ditemukan');
+    const acc = accountById(p.accountId);
+    if (!acc) return toolError('Akun tidak ditemukan');
+    const pay = Math.min(amount, Number(d.amount));
+    const isDebt = d.kind === 'debt';
+
+    const tx = { id: uid(), type: isDebt ? 'debt_payment' : 'receivable_payment', amount: pay,
+      category: isDebt ? `Pelunasan hutang ke ${d.person}` : `Pelunasan piutang dari ${d.person}`,
+      accountId: acc.id, date: p.date || todayStr(), note: p.note || '', createdAt: Date.now(), linkedDebtId: d.id };
+    state.transactions.push(tx);
+    acc.balance = Number(acc.balance) + (isDebt ? -pay : pay);
+    d.amount = Number(d.amount) - pay;
+    if (d.amount <= 0) { d.status = 'paid'; d.paidDate = tx.date; d.paidAccountId = acc.id; d.amount = 0; }
+    auditRecord({ tool: 'record_payment', params: { debtId: d.id, amount: pay, accountId: acc.id }, result: tx.id });
+    return toolOk({ remaining: d.amount, cleared: d.status === 'paid' });
+  },
+
+  // Update the most recent transaction (used for corrections).
+  update_last_transaction(p = {}) {
+    const tx = [...state.transactions].filter(t => !t.transfer).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))[0];
+    if (!tx) return toolError('Tidak ada transaksi untuk diubah');
+    const acc = accountById(tx.accountId);
+    if ('amount' in p) {
+      const newAmt = Number(p.amount);
+      if (!newAmt || newAmt <= 0) return toolError('Jumlah tidak valid');
+      if (acc) { // reverse old, apply new
+        const sign = TX_META[tx.type].sign === '+' ? 1 : -1;
+        acc.balance = Number(acc.balance) - sign * Number(tx.amount) + sign * newAmt;
+      }
+      tx.amount = newAmt;
+    }
+    if (p.category) tx.category = p.category;
+    if (p.accountId && p.accountId !== tx.accountId) {
+      const newAcc = accountById(p.accountId);
+      if (newAcc && acc) {
+        const sign = TX_META[tx.type].sign === '+' ? 1 : -1;
+        acc.balance = Number(acc.balance) - sign * Number(tx.amount);
+        newAcc.balance = Number(newAcc.balance) + sign * Number(tx.amount);
+        tx.accountId = newAcc.id;
+      }
+    }
+    auditRecord({ tool: 'update_last_transaction', params: p, result: tx.id });
+    return toolOk({ id: tx.id });
+  },
+
+  // Delete the most recent transaction (reverses balance; reactivates linked debt).
+  delete_last_transaction() {
+    const tx = [...state.transactions].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))[0];
+    if (!tx) return toolError('Tidak ada transaksi untuk dihapus');
+    deleteTransaction(tx.id);   // reuses existing safe deletion (handles balance + linked debt)
+    auditRecord({ tool: 'delete_last_transaction', params: {}, result: tx.id });
+    return toolOk({ id: tx.id });
+  }
+};
+
+// Dispatch a tool with a uniform verify + audit wrapper.
+function runTool(name, params) {
+  const fn = AgentTools[name];
+  if (!fn) return toolError('Tool tidak dikenal: ' + name);
+  let res;
+  try { res = fn(params || {}); }
+  catch (e) { console.error('[FinTrack] tool error', name, e); return toolError('Terjadi kesalahan internal'); }
+  return res;
+}
+
 // When the bot has parsed a transaction but is waiting for the user to pick an account
 let pendingTx = null;   // { items:[...], isIncome:bool }
 
@@ -944,8 +1128,8 @@ function closeAssistant() {
   stopListening();
 }
 function greetAssistant() {
-  botSay(`Halo! 👋 Saya ${botName()}, asisten keuangan pribadi Anda. Saya bisa membantu Anda:\n\n• Mencatat pengeluaran/pemasukan cukup dengan bahasa biasa\n• Memberi rekap harian, mingguan, bulanan, tahunan\n• Menjawab pertanyaan soal keuangan Anda\n• Belajar istilah baru dari Anda — contoh: "teazzi adalah minuman" 🧠\n\nTekan ⚙️ untuk mengganti nama & suara saya. Coba ketik atau ucapkan sesuatu!`, false);
-  renderSuggestions(['teazzi adalah minuman', 'Pengeluaran 15rb makan, 10rb parkir', 'Rekap bulan ini', 'Berapa saldo saya?']);
+  botSay(`Halo! 👋 Saya ${botName()}, asisten keuangan Anda. Bicara natural saja — saya paham dan langsung bertindak:\n\n• Catat transaksi: "beli kopi 20rb" (bisa banyak sekaligus)\n• Transfer: "transfer 500rb dari BCA ke GoPay"\n• Hutang/piutang: "aku pinjam 1jt dari Budi", "Budi bayar 300rb"\n• Koreksi: "eh salah, harusnya 30rb" / "hapus transaksi tadi"\n• Analisis: "kenapa bulan ini boros?", "bandingkan bulan ini vs lalu"\n• Latih saya: "teazzi adalah minuman" 🧠\n\nTekan ⚙️ untuk nama & suara. Coba ketik atau ucapkan sesuatu!`, false);
+  renderSuggestions(['beli kopi 20rb', 'kenapa bulan ini boros?', 'aku pinjam 1jt dari Budi', 'Berapa saldo saya?']);
 }
 function renderSuggestions(arr) {
   // items can be plain strings, or { label, account: id } for account-pick chips
@@ -1104,7 +1288,104 @@ function pickDefaultAccount() {
   return state.accounts.find(a => a.type === 'cash') || state.accounts[0];
 }
 
-/* ---- main command processor ---- */
+/* ============================================================
+   AGENT PIPELINE — Intent detection → Entity extraction →
+   Confidence → Structured action. Deterministic, fast, free.
+   ============================================================ */
+
+// Intent priority order matters: more specific intents first.
+function detectIntent(text) {
+  const low = ' ' + text.toLowerCase().trim() + ' ';
+
+  // corrections referencing a previous action
+  if (/(salah|keliru|maksud(ku|nya)?|harusnya|seharusnya|bukan|ganti jadi|ubah jadi|koreksi|revisi|eh )/.test(low)
+      && /(tadi|itu|terakhir|barusan|\d)/.test(low)) return { intent: 'correct_last', conf: 0.8 };
+  if (/(hapus|batalkan|delete|buang).*(transaksi|tadi|terakhir|barusan|itu)/.test(low)
+      || /^(hapus|batalkan) (yang )?(tadi|terakhir|barusan|itu)/.test(low.trim())) return { intent: 'delete_last', conf: 0.85 };
+
+  // transfer between own accounts
+  if (/(transfer|pindah(kan)?|mutasi|kirim).*(dari|ke).*(rekening|akun|bca|mandiri|gopay|ovo|dana|cash|tunai|bank|e-?wallet|dompet)/.test(low)
+      || /\btransfer\b.*\bke\b/.test(low) || /\bpindah(kan)?\b.*\bke\b/.test(low)) return { intent: 'transfer', conf: 0.75 };
+
+  // debt repayment / receivable collection (existing debt)
+  if (/(bayar|lunasi|cicil|nyicil).*(hutang|utang)/.test(low)
+      || /(bayar|lunasi).*(ke|kepada)\s+\w+/.test(low)) return { intent: 'pay_debt', conf: 0.7 };
+  if (/(balikin|kembaliin|mengembalikan|bayar(in)?|lunasin|nyaur|nyicil).*(hutang(nya)?|piutang|pinjaman)/.test(low)
+      || /\b(\w+)\s+(sudah|udah|udh)?\s*(bayar|balikin|kembaliin|lunas)/.test(low)) return { intent: 'collect_receivable', conf: 0.65 };
+
+  // new debt / receivable
+  if (/(aku|saya)\s+(pinjam|minjam|ngutang|hutang|utang)\s+(uang\s+)?(dari|ke|sama)\s+/.test(low)
+      || /(pinjam|minjam)\s+(uang\s+)?(dari|ke|sama)\s+\w+/.test(low)) return { intent: 'new_debt', conf: 0.75 };
+  if (/(aku|saya)\s+(hutangin|piutangin|minjemin|minjamin|pinjamin|talangin|bayarin|talangi)\s+/.test(low)
+      || /(minjemin|minjamin|pinjamin|talangin|bayarin)\s+\w+/.test(low)) return { intent: 'new_receivable', conf: 0.7 };
+
+  // analysis questions
+  if (/(kenapa|mengapa|napa).*(boros|besar|naik|banyak|habis|turun)/.test(low)) return { intent: 'analyze_why', conf: 0.8 };
+  if (/(bandingkan|banding|dibanding|compare|vs|versus)/.test(low)) return { intent: 'analyze_compare', conf: 0.8 };
+  if (/(paling banyak|terbesar|boros|terbanyak).*(spend|keluar|habis|belanja|pengeluaran)|kategori.*(banyak|besar|terbesar)/.test(low)) return { intent: 'analyze_top', conf: 0.75 };
+  if (/(analisa|analisis|pola|insight|kebiasaan|ringkas.*keuangan)/.test(low)) return { intent: 'analyze_overview', conf: 0.7 };
+
+  // recap
+  if (/(rekap|ringkas|laporan|summary|recap|rangkuman)/.test(low)) return { intent: 'recap', conf: 0.85 };
+
+  // balance / debt / receivable questions
+  if (/(saldo|uang saya|kekayaan|net worth|berapa uang|total uang)/.test(low)) return { intent: 'ask_balance', conf: 0.85 };
+  // receivable check must come BEFORE debt: "siapa yang hutang ke aku", "piutang"
+  if (/(piutang|yang berhutang (ke|sama) (aku|saya)|hutang (ke|sama) (aku|saya)|siapa.*(hutang|utang))/.test(low) && !/catat|tambah/.test(low)) return { intent: 'ask_receivable', conf: 0.72 };
+  if (/(hutang|utang|pinjaman)/.test(low) && !/catat|bayar|tambah|pinjam|minjam/.test(low)) return { intent: 'ask_debt', conf: 0.75 };
+
+  // teaching
+  if (/(daftar|lihat|apa saja|list).*(pelajaran|istilah|kata)|apa.*(kamu|km).*(pelajari|ingat|hafal)/.test(low)) return { intent: 'list_learned', conf: 0.8 };
+  if (/^(lupakan|hapus istilah|forget|buang istilah)\s+/.test(low.trim())) return { intent: 'forget_term', conf: 0.8 };
+
+  // help
+  if (/(bantuan|help|apa yang bisa|fitur|cara pakai|apa saja yang bisa)/.test(low)) return { intent: 'help', conf: 0.7 };
+
+  // record transaction (has a money amount → likely a record)
+  if (extractAmount(text)) return { intent: 'record_tx', conf: 0.6 };
+
+  return { intent: 'unknown', conf: 0.2 };
+}
+
+// Extract a person name after common debt keywords.
+function extractPerson(text) {
+  const m = text.match(/\b(?:dari|ke|kepada|sama|si|buat)\s+([A-Z][\p{L}]+(?:\s+[A-Z][\p{L}]+)?)/u)
+         || text.match(/\b(?:hutangin|piutangin|minjemin|minjamin|pinjamin|talangin|bayarin|pinjam|minjam)\s+(?:uang\s+)?(?:dari|ke|sama)?\s*([\p{L}]+)/iu)
+         || text.match(/^([\p{L}]+)\s+(?:sudah|udah|udh|bayar|balikin|kembaliin|lunas)/iu);
+  if (m) {
+    let name = m[1].trim().replace(/\s+/g, ' ');
+    // strip trailing filler
+    name = name.replace(/\s+(uang|duit|sebesar|sejumlah).*$/i, '').trim();
+    if (name && name.length >= 2 && !/^(uang|duit|dari|ke|sama)$/i.test(name)) {
+      return name.charAt(0).toUpperCase() + name.slice(1);
+    }
+  }
+  return null;
+}
+
+// Find which of the user's accounts are mentioned in the text (for transfers).
+function extractMentionedAccounts(text) {
+  const low = text.toLowerCase();
+  const hits = [];
+  state.accounts.forEach(a => { if (low.includes(a.name.toLowerCase())) hits.push({ acc: a, at: low.indexOf(a.name.toLowerCase()) }); });
+  // also type keywords
+  const typeKw = [['cash', /\b(cash|tunai|kontan)\b/], ['bank', /\b(bank|rekening)\b/], ['ewallet', /\b(e-?wallet|dompet|dana|ovo|gopay|shopeepay)\b/]];
+  typeKw.forEach(([type, re]) => { const m = low.match(re); if (m) { const a = state.accounts.find(x => x.type === type); if (a && !hits.some(h => h.acc.id === a.id)) hits.push({ acc: a, at: m.index }); } });
+  return hits.sort((x, y) => x.at - y.at).map(h => h.acc);
+}
+
+// Find an active debt/receivable matching a person mentioned in text.
+function findDebtByText(text, kind) {
+  const person = extractPerson(text);
+  const cands = state.debts.filter(d => d.kind === kind && d.status === 'active');
+  if (person) { const hit = cands.find(d => d.person.toLowerCase().includes(person.toLowerCase()) || person.toLowerCase().includes(d.person.toLowerCase())); if (hit) return { debt: hit, person }; }
+  // fallback: any name token matches
+  const low = text.toLowerCase();
+  const hit = cands.find(d => low.includes(d.person.toLowerCase()));
+  return { debt: hit || null, person: person || (hit ? hit.person : null) };
+}
+
+/* ---- main command processor (agent router) ---- */
 function processCommand(text) {
   const low = text.toLowerCase();
 
@@ -1117,7 +1398,6 @@ function processCommand(text) {
     }
     const acc = resolveAccountFromText(text);
     if (acc) return commitTransactions(acc.id);
-    // couldn't tell which account → re-ask with chips
     botSay('Maaf, akun mana ya? Silakan pilih salah satu di bawah, atau sebut nama akunnya. 🙂', true);
     const chips = state.accounts.map(a => ({ label: `${(ACC_TYPE[a.type]||ACC_TYPE.other).icon} ${a.name} · ${rp(a.balance)}`, account: a.id }));
     chips.push({ label: '✕ Batal' });
@@ -1125,80 +1405,292 @@ function processCommand(text) {
     return;
   }
 
-  // 0) TRAINING commands — check first so "teazzi adalah minuman" isn't parsed as a transaction
+  // -0.5) Waiting for an account to record a debt/receivable payment?
+  if (pendingPayment) {
+    if (/(batal|cancel|gak jadi|ga jadi|tidak jadi|stop)/.test(low)) {
+      pendingPayment = null; renderSuggestions(defaultSuggestions());
+      return botSay('Oke, dibatalkan. 👍', true);
+    }
+    const acc = resolveAccountFromText(text);
+    if (acc) { const c = pendingPayment.commit; pendingPayment = null; return c(acc.id); }
+    botSay('Akun mana ya? Pilih di bawah atau sebut namanya. 🙂', true);
+    const chips = state.accounts.map(a => ({ label: `${(ACC_TYPE[a.type]||ACC_TYPE.other).icon} ${a.name} · ${rp(a.balance)}`, account: '__pay__' + a.id }));
+    chips.push({ label: '✕ Batal' });
+    renderSuggestions(chips);
+    return;
+  }
 
-  // List learned terms
-  if (/(daftar|lihat|apa saja|list).*(pelajaran|istilah|kata|yang.*(diajar|dilatih|kamu.*ingat))|apa.*(kamu|km).*(sudah|udah).*(pelajari|ingat|hafal)/.test(low)) {
-    return botListLearned();
-  }
-  // Forget a term: "lupakan teazzi" / "hapus istilah teazzi"
-  const forget = text.match(/(?:lupakan|hapus|forget|buang)\s+(?:istilah\s+|kata\s+)?["']?([\p{L}\p{N}\s]+?)["']?$/iu);
-  if (forget && /(lupakan|hapus|forget|buang)/i.test(low)) {
-    return botForgetTerm(forget[1].trim());
-  }
-  // Teach: "teazzi adalah minuman" / "teazzi itu kategori minuman" / "kalau beli teazzi masukkan ke minuman"
+  // 0) TEACHING — check before intents so "teazzi adalah minuman" isn't a transaction
   const taught = parseTeaching(text);
   if (taught) return botLearnTerm(taught.term, taught.category);
 
-  // 1) RECAP requests
-  if (/(rekap|ringkas|laporan|summary|recap|rangkuman)/.test(low)) {
-    let period = 'month';
-    if (/hari|harian|today|day/.test(low)) period = 'day';
-    else if (/minggu|mingguan|pekan|week/.test(low)) period = 'week';
-    else if (/tahun|tahunan|year/.test(low)) period = 'year';
-    else if (/bulan|bulanan|month/.test(low)) period = 'month';
-    return botRecap(period);
+  // ===== AGENT PIPELINE: intent detection → route to handler =====
+  const { intent, conf } = detectIntent(text);
+  auditRecord({ userMessage: text, intent, confidence: conf, phase: 'detect' });
+
+  switch (intent) {
+    case 'list_learned':   return botListLearned();
+    case 'forget_term': {
+      const f = text.match(/(?:lupakan|hapus istilah|forget|buang istilah)\s+["']?([\p{L}\p{N}\s]+?)["']?$/iu);
+      return botForgetTerm(f ? f[1].trim() : text.replace(/^(lupakan|hapus istilah|forget|buang istilah)\s+/i, '').trim());
+    }
+    case 'delete_last':      return agentDeleteLast();
+    case 'correct_last':     return agentCorrectLast(text);
+    case 'transfer':         return agentTransfer(text);
+    case 'new_debt':         return agentNewDebt(text, 'debt');
+    case 'new_receivable':   return agentNewDebt(text, 'receivable');
+    case 'pay_debt':         return agentPayDebt(text, 'debt');
+    case 'collect_receivable': return agentPayDebt(text, 'receivable');
+    case 'analyze_why':      return analyzeWhy();
+    case 'analyze_compare':  return analyzeCompare();
+    case 'analyze_top':      return analyzeTop();
+    case 'analyze_overview': return analyzeOverview();
+    case 'recap': {
+      let period = 'month';
+      if (/hari|harian|today|day/.test(low)) period = 'day';
+      else if (/minggu|mingguan|pekan|week/.test(low)) period = 'week';
+      else if (/tahun|tahunan|year/.test(low)) period = 'year';
+      return botRecap(period);
+    }
+    case 'ask_balance': {
+      const b = runTool('get_balances');
+      return botSay(`Ringkasan saldo Anda:\n• Saldo likuid (murni): ${rp(b.clean)}\n• Kekayaan bersih (termasuk hutang & piutang): ${rp(b.net)}\n• Total hutang aktif: ${rp(b.debt)}\n• Total piutang aktif: ${rp(b.receivable)}`, true);
+    }
+    case 'ask_debt': {
+      const debts = runTool('get_debts', { status: 'active' }).debts;
+      if (!debts.length) return botSay('Anda tidak punya hutang aktif saat ini. 🎉', true);
+      let msg = `Anda punya ${debts.length} hutang aktif, total ${rp(totalDebtActive())}:\n`;
+      debts.forEach(d => { msg += `• ${d.person}: ${rp(d.amount)}${d.due ? ` (tempo ${fmtDateShort(d.due)})` : ''}\n`; });
+      return botSay(msg, true);
+    }
+    case 'ask_receivable': {
+      const recs = runTool('get_receivables', { status: 'active' }).receivables;
+      if (!recs.length) return botSay('Tidak ada piutang aktif saat ini.', true);
+      let msg = `${recs.length} orang masih berhutang ke Anda, total ${rp(totalReceivableActive())}:\n`;
+      recs.forEach(d => { msg += `• ${d.person}: ${rp(d.amount)}\n`; });
+      return botSay(msg, true);
+    }
+    case 'help':
+      return botSay("Saya asisten keuangan Anda. Yang bisa saya lakukan:\n\n1. Catat transaksi — \"beli kopi 20rb\", atau beberapa sekaligus \"makan 30k, grab 25k\"\n2. Transfer — \"transfer 500rb dari BCA ke GoPay\"\n3. Hutang & piutang — \"aku pinjam 1jt dari Budi\", \"Budi bayar 300rb\"\n4. Koreksi — \"eh salah, harusnya 30rb\" atau \"hapus transaksi tadi\"\n5. Analisis — \"kenapa bulan ini boros?\", \"bandingkan bulan ini vs lalu\"\n6. Rekap & saldo — \"rekap mingguan\", \"berapa saldo saya?\"\n7. Latih saya — \"teazzi adalah minuman\"\n\nAnda juga bisa bicara lewat tombol mik 🎤.", false);
+    case 'record_tx': {
+      const { items, isIncome } = parseTransactions(text);
+      if (items.length > 0) return botAddTransactions(items, isIncome);
+      break; // fall through to chit-chat/fallback
+    }
   }
 
-  // 2) Balance / saldo question
-  if (/(saldo|uang saya|kekayaan|net worth|berapa uang)/.test(low)) {
-    const msg = `Ringkasan saldo Anda:\n• Saldo likuid (murni): ${rp(cleanBalance())}\n• Kekayaan bersih (termasuk hutang & piutang): ${rp(netBalance())}\n• Total hutang aktif: ${rp(totalDebtActive())}\n• Total piutang aktif: ${rp(totalReceivableActive())}`;
-    return botSay(msg, true);
-  }
-
-  // 3) Debt question
-  if (/(hutang|utang|pinjaman)/.test(low) && !/catat|bayar|tambah/.test(low)) {
-    const debts = state.debts.filter(d => d.kind==='debt' && d.status==='active');
-    if (debts.length === 0) return botSay('Anda tidak punya hutang aktif saat ini. 🎉', true);
-    let msg = `Anda punya ${debts.length} hutang aktif, total ${rp(totalDebtActive())}:\n`;
-    debts.forEach(d => { msg += `• ${d.person}: ${rp(d.amount)}${d.due?` (tempo ${fmtDateShort(d.due)})`:''}\n`; });
-    return botSay(msg, true);
-  }
-  if (/(piutang|tagihan saya|yang berhutang)/.test(low) && !/catat|tambah/.test(low)) {
-    const recs = state.debts.filter(d => d.kind==='receivable' && d.status==='active');
-    if (recs.length === 0) return botSay('Tidak ada piutang aktif saat ini.', true);
-    let msg = `Anda punya ${recs.length} piutang aktif, total ${rp(totalReceivableActive())}:\n`;
-    recs.forEach(d => { msg += `• ${d.person}: ${rp(d.amount)}\n`; });
-    return botSay(msg, true);
-  }
-
-  // 4) Biggest spending question
-  if (/(paling banyak|terbesar|boros|terbanyak).*(spend|keluar|habis|belanja|pengeluaran)|kategori.*(banyak|besar)/.test(low)) {
-    const cats = categoryBreakdown(monthKey(new Date()), 'month');
-    if (cats.length === 0) return botSay('Belum ada pengeluaran bulan ini.', true);
-    const top = cats[0];
-    return botSay(`Bulan ini pengeluaran terbesar Anda di kategori "${top.cat}" sebesar ${rp(top.total)}.`, true);
-  }
-
-  // 5) Help
-  if (/(bantuan|help|apa yang bisa|fitur|cara pakai)/.test(low)) {
-    return botSay("Saya bisa membantu Anda:\n\n1. Mencatat transaksi — contoh: \"pengeluaran 20rb makan siang, 15rb bensin\"\n2. Rekap — \"rekap mingguan\" / \"rekap bulan ini\"\n3. Info saldo — \"berapa saldo saya?\"\n4. Info hutang/piutang — \"hutang saya berapa?\"\n5. Melatih saya — \"teazzi adalah minuman\", lalu \"lihat pelajaran\" untuk daftar, atau \"lupakan teazzi\" untuk hapus.\n\nAnda juga bisa menekan tombol mik 🎤 untuk bicara langsung.", false);
-  }
-
-  // 6) TRANSACTION parsing (has numbers → likely a record)
-  const { items, isIncome } = parseTransactions(text);
-  if (items.length > 0) return botAddTransactions(items, isIncome);
-
-  // 7) Conversational / small talk (natural chat like a personal assistant)
+  // Conversational / small talk
   if (chitChat(text)) return;
 
-  // fallback — friendly, not a dead-end
+  // Low-confidence fallback — friendly, not a dead-end
   const tips = [
-    `Hmm, saya belum yakin menangkap maksudnya. 🤔 Saya paling jago soal keuangan Anda — coba katakan misalnya "pengeluaran 25rb makan siang", atau tanya "berapa saldo saya?"`,
-    `Boleh diulang dengan cara lain? Misalnya "catat 50rb belanja", "rekap minggu ini", atau "hutang saya berapa?" 😊`,
-    `Saya di sini untuk bantu keuangan Anda. Anda bisa mencatat pengeluaran, minta rekap, atau tanya saldo/hutang kapan saja.`
+    `Hmm, saya belum yakin menangkap maksudnya. 🤔 Coba misalnya "beli kopi 20rb", "transfer 100rb dari BCA ke Cash", atau tanya "berapa saldo saya?"`,
+    `Boleh diulang? Misalnya "catat 50rb belanja", "aku pinjam 1jt dari Budi", atau "kenapa bulan ini boros?" 😊`,
+    `Saya di sini untuk bantu keuangan Anda — mencatat, transfer, hutang/piutang, koreksi, rekap, dan analisis. Coba sebutkan salah satu.`
   ];
   botSay(pick(tips), true);
+}
+
+/* ============================================================
+   AGENT INTENT HANDLERS — transfer, debt/receivable, corrections
+   ============================================================ */
+let pendingPayment = null;   // { commit(accountId) } while awaiting account for a payment
+
+function agentTransfer(text) {
+  if (state.accounts.length < 2) return botSay('Untuk transfer, Anda perlu minimal 2 akun. Tambahkan akun dulu di menu "Akun & Saldo". 🙂', true);
+  const amt = extractAmount(text);
+  const accs = extractMentionedAccounts(text);
+  if (!amt) return botSay('Berapa jumlah yang mau ditransfer? Contoh: "transfer 200rb dari BCA ke GoPay".', true);
+  if (accs.length < 2) return botSay(`Transfer ${rp(amt.val)} dari akun mana ke akun mana? Sebutkan keduanya, contoh: "dari BCA ke GoPay".`, true);
+  const [from, to] = accs;
+  const res = runTool('transfer', { amount: amt.val, fromId: from.id, toId: to.id });
+  if (!res.ok) { if (res.error === '__duplicate__') return; return botSay('Maaf, transfer gagal: ' + res.error, true); }
+  save(); renderAll();
+  const html = `<b>🔄 Transfer berhasil</b><div class="msg-table"><div class="msg-table-row"><span>${escapeHtml(from.name)} → ${escapeHtml(to.name)}</span><span>${rp(amt.val)}</span></div><div class="msg-table-row"><span>Sisa ${escapeHtml(from.name)}</span><span>${rp(res.fromBalance)}</span></div><div class="msg-table-row"><span>Sisa ${escapeHtml(to.name)}</span><span>${rp(res.toBalance)}</span></div></div>`;
+  botSay(`Transfer ${rpSpeech(amt.val)} dari ${from.name} ke ${to.name} berhasil.`, false, html);
+  if (state.settings.voiceReply) speakText(`Transfer ${rpSpeech(amt.val)} dari ${from.name} ke ${to.name} berhasil.`);
+  renderSuggestions(defaultSuggestions());
+}
+
+function agentNewDebt(text, kind) {
+  const amt = extractAmount(text);
+  const person = extractPerson(text);
+  if (!amt) return botSay(kind === 'debt' ? 'Berapa jumlah yang Anda pinjam? Contoh: "aku pinjam 1jt dari Budi".' : 'Berapa jumlah yang Anda pinjamkan? Contoh: "aku minjemin Budi 500rb".', true);
+  if (!person) return botSay(kind === 'debt' ? `Anda pinjam ${rp(amt.val)} dari siapa?` : `Anda pinjamkan ${rp(amt.val)} ke siapa?`, true);
+  const res = runTool('create_debt', { kind, amount: amt.val, person });
+  if (!res.ok) { if (res.error === '__duplicate__') return; return botSay('Maaf, gagal mencatat: ' + res.error, true); }
+  save(); renderAll();
+  const label = kind === 'debt' ? 'Hutang' : 'Piutang';
+  const line = kind === 'debt' ? `Anda berhutang ${rp(amt.val)} kepada ${person}` : `${person} berhutang ${rp(amt.val)} kepada Anda`;
+  const html = `<b>🤝 ${label} tercatat</b><div class="msg-table"><div class="msg-table-row"><span>${escapeHtml(person)}</span><span>${rp(amt.val)}</span></div></div><div style="margin-top:6px;color:var(--muted);font-size:12px">${escapeHtml(line)}.</div>`;
+  botSay(`${label} tercatat. ${line}.`, false, html);
+  if (state.settings.voiceReply) speakText(`${label} tercatat. ${line}.`);
+  renderSuggestions(['Hutang saya berapa?', 'Siapa yang hutang ke saya?', 'Rekap bulan ini']);
+}
+
+// Repayment (kind='debt') or collection (kind='receivable') against existing record.
+function agentPayDebt(text, kind) {
+  const amt = extractAmount(text);
+  const { debt } = findDebtByText(text, kind);
+  const activeList = state.debts.filter(d => d.kind === kind && d.status === 'active');
+  if (activeList.length === 0) return botSay(kind === 'debt' ? 'Anda tidak punya hutang aktif untuk dibayar. 🎉' : 'Tidak ada piutang aktif untuk ditagih.', true);
+  if (!debt) {
+    const names = activeList.map(d => d.person).join(', ');
+    return botSay(kind === 'debt' ? `Bayar hutang ke siapa? Yang aktif: ${names}.` : `Siapa yang membayar? Yang berhutang: ${names}.`, true);
+  }
+  if (!amt) return botSay(kind === 'debt' ? `Berapa yang dibayarkan ke ${debt.person}? (sisa ${rp(debt.amount)})` : `Berapa yang ${debt.person} bayarkan? (sisa ${rp(debt.amount)})`, true);
+  if (state.accounts.length === 0) return botSay('Anda belum punya akun. Tambahkan dulu di menu "Akun & Saldo".', true);
+
+  const payAmt = amt.val;
+  const commit = (accId) => {
+    const res = runTool('record_payment', { debtId: debt.id, amount: payAmt, accountId: accId });
+    if (!res.ok) { if (res.error === '__duplicate__') return; return botSay('Maaf, gagal: ' + res.error, true); }
+    save(); renderAll();
+    const acc = accountById(accId);
+    const verb = kind === 'debt' ? 'Anda membayar' : `${debt.person} membayar`;
+    const remainTxt = res.cleared ? 'LUNAS 🎉' : `sisa ${rp(res.remaining)}`;
+    const html = `<b>✅ Pembayaran tercatat</b><div class="msg-table"><div class="msg-table-row"><span>${escapeHtml(debt.person)}</span><span>${rp(payAmt)}</span></div><div class="msg-table-row total"><span>Status</span><span>${remainTxt}</span></div><div class="msg-table-row"><span>Via akun</span><span>${escapeHtml(acc.name)}</span></div></div>`;
+    const speak = `${verb} ${rpSpeech(payAmt)}. ${res.cleared ? 'Sudah lunas.' : 'Sisa ' + rpSpeech(res.remaining) + '.'}`;
+    botSay(speak, false, html);
+    if (state.settings.voiceReply) speakText(speak);
+    renderSuggestions(defaultSuggestions());
+  };
+  if (state.accounts.length === 1) return commit(state.accounts[0].id);
+  pendingPayment = { commit };
+  const dir = kind === 'debt' ? 'diambil dari' : 'masuk ke';
+  botSay(`${rp(payAmt)} untuk ${debt.person}. Uang ${dir} akun mana?`, true);
+  const chips = state.accounts.map(a => ({ label: `${(ACC_TYPE[a.type]||ACC_TYPE.other).icon} ${a.name} · ${rp(a.balance)}`, account: '__pay__' + a.id }));
+  chips.push({ label: '✕ Batal' });
+  renderSuggestions(chips);
+}
+
+function agentDeleteLast() {
+  const tx = [...state.transactions].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))[0];
+  if (!tx) return botSay('Belum ada transaksi yang bisa dihapus.', true);
+  const desc = `${TX_META[tx.type].label} ${rp(tx.amount)}${tx.category ? ' · ' + tx.category : ''}`;
+  const res = runTool('delete_last_transaction');
+  if (!res.ok) return botSay('Maaf, gagal menghapus: ' + res.error, true);
+  botSay(`Transaksi terakhir dihapus: ${desc}. Saldo sudah dikembalikan. 👍`, true);
+  renderSuggestions(defaultSuggestions());
+}
+
+function agentCorrectLast(text) {
+  const tx = [...state.transactions].filter(t => !t.transfer).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))[0];
+  if (!tx) return botSay('Belum ada transaksi untuk dikoreksi.', true);
+  const amt = extractAmount(text);
+  const newAccs = extractMentionedAccounts(text);
+  const params = {};
+  if (amt) params.amount = amt.val;
+  if (newAccs.length) params.accountId = newAccs[0].id;
+  const catM = text.match(/(?:harusnya|seharusnya|masuk(?:in|kan)?|kategori(?:nya)?|jadi)\s+([\p{L}\/&\s]+)$/iu);
+  if (catM) { const c = normalizeCategory(catM[1].trim()); if (c) params.category = c; }
+  if (!('amount' in params) && !params.accountId && !params.category)
+    return botSay('Apa yang mau dikoreksi dari transaksi terakhir? Sebutkan jumlah, kategori, atau akun. Contoh: "harusnya 30rb".', true);
+  const res = runTool('update_last_transaction', params);
+  if (!res.ok) return botSay('Maaf, gagal mengoreksi: ' + res.error, true);
+  save(); renderAll();
+  const updated = state.transactions.find(t => t.id === res.id);
+  const acc = accountById(updated.accountId);
+  const html = `<b>✏️ Transaksi terakhir dikoreksi</b><div class="msg-table"><div class="msg-table-row"><span>${escapeHtml(updated.category)}${updated.note ? ' · ' + escapeHtml(updated.note) : ''}</span><span>${rp(updated.amount)}</span></div><div class="msg-table-row"><span>Akun</span><span>${escapeHtml(acc ? acc.name : '-')}</span></div></div>`;
+  botSay('Sudah saya koreksi transaksi terakhir. 👍', false, html);
+  if (state.settings.voiceReply) speakText('Sudah saya koreksi transaksi terakhir.');
+  renderSuggestions(defaultSuggestions());
+}
+
+/* ============================================================
+   FINANCIAL ANALYSIS — real numbers from the database only.
+   Never fabricates figures.
+   ============================================================ */
+function monthExpense(mKey) { return monthlySum('expense', mKey) + monthlySum('debt_payment', mKey); }
+function monthIncome(mKey) { return monthlySum('income', mKey) + monthlySum('receivable_payment', mKey); }
+
+function analyzeTop() {
+  const cats = categoryBreakdown(monthKey(new Date()), 'month');
+  if (!cats.length) return botSay('Belum ada pengeluaran bulan ini, jadi belum ada yang bisa dianalisa. 🙂', true);
+  const total = cats.reduce((s, c) => s + c.total, 0);
+  const top = cats.slice(0, 5);
+  let html = `<b>🏆 Kategori pengeluaran terbesar bulan ini</b><div class="msg-table">`;
+  top.forEach((c, i) => { html += `<div class="msg-table-row"><span>${i+1}. ${escapeHtml(c.cat)}</span><span>${rp(c.total)} · ${Math.round(c.total/total*100)}%</span></div>`; });
+  html += `<div class="msg-table-row total"><span>Total</span><span>${rp(total)}</span></div></div>`;
+  const speak = `Pengeluaran terbesar bulan ini di ${cats[0].cat}, ${rpSpeech(cats[0].total)}, sekitar ${Math.round(cats[0].total/total*100)} persen dari total.`;
+  botSay(speak, false, html);
+  if (state.settings.voiceReply) speakText(speak);
+  renderSuggestions(['Bandingkan dengan bulan lalu', 'Kenapa bulan ini boros?', 'Rekap bulan ini']);
+}
+
+function analyzeCompare() {
+  const now = new Date();
+  const curKey = monthKey(now);
+  const prevKey = monthKey(new Date(now.getFullYear(), now.getMonth() - 1, 1));
+  const curExp = monthExpense(curKey), prevExp = monthExpense(prevKey);
+  const curInc = monthIncome(curKey), prevInc = monthIncome(prevKey);
+  const diff = curExp - prevExp;
+  const arrow = diff > 0 ? 'naik' : (diff < 0 ? 'turun' : 'sama');
+  // category deltas
+  const curCats = Object.fromEntries(categoryBreakdown(curKey, 'month').map(c => [c.cat, c.total]));
+  const prevCats = Object.fromEntries(categoryBreakdown(prevKey, 'month').map(c => [c.cat, c.total]));
+  const allCats = new Set([...Object.keys(curCats), ...Object.keys(prevCats)]);
+  const deltas = [...allCats].map(c => ({ cat: c, delta: (curCats[c] || 0) - (prevCats[c] || 0) })).sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta)).slice(0, 3);
+  let html = `<b>📊 Bulan ini vs bulan lalu</b><div class="msg-table">`;
+  html += `<div class="msg-table-row"><span>Pengeluaran bulan ini</span><span>${rp(curExp)}</span></div>`;
+  html += `<div class="msg-table-row"><span>Pengeluaran bulan lalu</span><span>${rp(prevExp)}</span></div>`;
+  html += `<div class="msg-table-row total"><span>Selisih</span><span style="color:${diff>0?'var(--danger)':'var(--success)'}">${diff>0?'+':''}${rp(diff)} (${arrow})</span></div></div>`;
+  if (deltas.length && deltas[0].delta !== 0) {
+    html += `<div class="msg-table"><div style="font-weight:700;margin-bottom:4px">Perubahan terbesar per kategori:</div>`;
+    deltas.forEach(d => { if (d.delta !== 0) html += `<div class="msg-table-row"><span>${escapeHtml(d.cat)}</span><span style="color:${d.delta>0?'var(--danger)':'var(--success)'}">${d.delta>0?'+':''}${rp(d.delta)}</span></div>`; });
+    html += `</div>`;
+  }
+  const speak = `Pengeluaran bulan ini ${rpSpeech(curExp)}, ${arrow} ${rpSpeech(Math.abs(diff))} dibanding bulan lalu.`;
+  botSay(speak, false, html);
+  if (state.settings.voiceReply) speakText(speak);
+  renderSuggestions(['Kategori terbesar apa?', 'Rekap bulan ini', 'Berapa saldo saya?']);
+}
+
+function analyzeWhy() {
+  const now = new Date();
+  const curKey = monthKey(now);
+  const prevKey = monthKey(new Date(now.getFullYear(), now.getMonth() - 1, 1));
+  const curExp = monthExpense(curKey), prevExp = monthExpense(prevKey);
+  if (curExp === 0) return botSay('Belum ada pengeluaran tercatat bulan ini. 🙂', true);
+  const diff = curExp - prevExp;
+  const curCats = Object.fromEntries(categoryBreakdown(curKey, 'month').map(c => [c.cat, c.total]));
+  const prevCats = Object.fromEntries(categoryBreakdown(prevKey, 'month').map(c => [c.cat, c.total]));
+  const allCats = new Set([...Object.keys(curCats), ...Object.keys(prevCats)]);
+  const risers = [...allCats].map(c => ({ cat: c, delta: (curCats[c] || 0) - (prevCats[c] || 0) })).filter(d => d.delta > 0).sort((a, b) => b.delta - a.delta).slice(0, 3);
+
+  let msg;
+  if (prevExp === 0) {
+    const top = categoryBreakdown(curKey, 'month').slice(0, 3);
+    msg = `Bulan ini Anda mengeluarkan ${rp(curExp)}. Terbesar: ` + top.map(c => `${c.cat} (${rp(c.total)})`).join(', ') + '.';
+  } else if (diff <= 0) {
+    msg = `Kabar baik — bulan ini justru ${diff === 0 ? 'sama saja' : 'lebih hemat ' + rp(-diff)} dibanding bulan lalu (${rp(curExp)} vs ${rp(prevExp)}). 👍`;
+  } else {
+    msg = `Pengeluaran bulan ini ${rp(curExp)}, naik ${rp(diff)} dari bulan lalu (${rp(prevExp)}). `;
+    if (risers.length) msg += 'Kenaikan terbesar dari: ' + risers.map(r => `${r.cat} (+${rp(r.delta)})`).join(', ') + '.';
+  }
+  botSay(msg, true);
+  renderSuggestions(['Bandingkan detailnya', 'Kategori terbesar apa?', 'Rekap bulan ini']);
+}
+
+function analyzeOverview() {
+  const now = new Date();
+  const curKey = monthKey(now);
+  const inc = monthIncome(curKey), exp = monthExpense(curKey);
+  const net = inc - exp;
+  const rate = inc > 0 ? Math.round(net / inc * 100) : 0;
+  const cats = categoryBreakdown(curKey, 'month');
+  const txCount = state.transactions.filter(t => t.date.startsWith(curKey)).length;
+  let html = `<b>🧭 Ringkasan keuangan bulan ini</b><div class="msg-table">`;
+  html += `<div class="msg-table-row"><span>Pemasukan</span><span style="color:var(--success)">${rp(inc)}</span></div>`;
+  html += `<div class="msg-table-row"><span>Pengeluaran</span><span style="color:var(--danger)">${rp(exp)}</span></div>`;
+  html += `<div class="msg-table-row total"><span>Arus kas bersih</span><span>${rp(net)}</span></div>`;
+  html += `<div class="msg-table-row"><span>Tingkat menabung</span><span>${rate}%</span></div>`;
+  html += `<div class="msg-table-row"><span>Jumlah transaksi</span><span>${txCount}</span></div></div>`;
+  if (cats.length) html += `<div style="margin-top:6px;color:var(--muted);font-size:12px">Kategori terbesar: ${escapeHtml(cats[0].cat)} (${rp(cats[0].total)}).</div>`;
+  const speak = `Bulan ini pemasukan ${rpSpeech(inc)}, pengeluaran ${rpSpeech(exp)}, arus kas bersih ${rpSpeech(net)}. Tingkat menabung ${rate} persen.`;
+  botSay(speak, false, html);
+  if (state.settings.voiceReply) speakText(speak);
+  renderSuggestions(['Kenapa bulan ini boros?', 'Bandingkan dengan bulan lalu', 'Kategori terbesar apa?']);
 }
 
 /* ---- pick a random variant so replies don't feel robotic ---- */
@@ -1379,23 +1871,30 @@ function commitTransactions(accountId, items, isIncome) {
 
   let total = 0;
   const rows = [];
+  let dupCount = 0;
   items.forEach(it => {
     const type = isIncome ? 'income' : 'expense';
     let category = it.category;
     if (isIncome && !isIncomeCategory(category)) category = 'Lainnya';
-    state.transactions.push({ id: uid(), type, amount: it.amount, category, accountId: acc.id, date: todayStr(), note: it.desc, createdAt: Date.now() });
-    acc.balance = Number(acc.balance) + (isIncome ? it.amount : -it.amount);
+    // Route through the idempotent, audited tool.
+    const res = runTool('create_transaction', { type, amount: it.amount, category, accountId: acc.id, note: it.desc, merchant: it.merchant });
+    if (!res.ok) { if (res.error === '__duplicate__') dupCount++; return; }
     total += it.amount;
     rows.push({ desc: it.desc, category, amount: it.amount });
   });
   save(); renderAll();
 
+  if (rows.length === 0) {
+    renderSuggestions(defaultSuggestions());
+    return botSay(dupCount ? 'Sepertinya transaksi itu baru saja tercatat, jadi tidak saya duplikasi. 🙂' : 'Tidak ada transaksi yang tercatat.', true);
+  }
+
   const kindTxt = isIncome ? 'pemasukan' : 'pengeluaran';
-  let html = `<b>✅ ${items.length} ${kindTxt} tercatat</b> (akun: ${escapeHtml(acc.name)})<div class="msg-table">`;
+  let html = `<b>✅ ${rows.length} ${kindTxt} tercatat</b> (akun: ${escapeHtml(acc.name)})<div class="msg-table">`;
   rows.forEach(r => { html += `<div class="msg-table-row"><span>${escapeHtml(r.desc)} <i style="color:var(--faint)">· ${escapeHtml(r.category)}</i></span><span>${rp(r.amount)}</span></div>`; });
   html += `<div class="msg-table-row total"><span>Total</span><span>${rp(total)}</span></div>`;
   html += `<div class="msg-table-row"><span>Sisa saldo ${escapeHtml(acc.name)}</span><span>${rp(acc.balance)}</span></div></div>`;
-  const speak = `${items.length} ${kindTxt} berhasil dicatat di ${acc.name}, total ${rpSpeech(total)}. Sisa saldo ${acc.name} ${rpSpeech(acc.balance)}.`;
+  const speak = `${rows.length} ${kindTxt} berhasil dicatat di ${acc.name}, total ${rpSpeech(total)}. Sisa saldo ${acc.name} ${rpSpeech(acc.balance)}.`;
   botSay(speak, false, html);
   if (state.settings.voiceReply) speakText(speak);
   renderSuggestions(defaultSuggestions());
@@ -1843,17 +2342,31 @@ function init() {
   document.getElementById('assistantSuggestions').addEventListener('click', (e) => {
     const chip = e.target.closest('.suggestion-chip');
     if (!chip) return;
-    // Account-pick chip → commit the pending transaction to that account
-    if (chip.dataset.account && pendingTx) {
-      const acc = accountById(chip.dataset.account);
+    // Guard against double-processing the same click (event can re-fire when the
+    // container is re-rendered mid-handler).
+    if (chip.dataset.handled === '1') return;
+    chip.dataset.handled = '1';
+    const accData = chip.dataset.account || '';
+    // Payment account-pick chip (debt/receivable) → commit via pendingPayment
+    if (accData.startsWith('__pay__') && pendingPayment) {
+      const id = accData.slice(7);
+      const acc = accountById(id);
       addMessage(acc ? acc.name : chip.textContent, 'user');
       renderSuggestions([]);
-      return commitTransactions(chip.dataset.account);
+      const c = pendingPayment.commit; pendingPayment = null;
+      return c(id);
     }
-    // "Batal" chip while a transaction is pending
-    if (pendingTx && /batal/i.test(chip.textContent)) {
+    // Account-pick chip → commit the pending transaction to that account
+    if (accData && !accData.startsWith('__pay__') && pendingTx) {
+      const acc = accountById(accData);
+      addMessage(acc ? acc.name : chip.textContent, 'user');
+      renderSuggestions([]);
+      return commitTransactions(accData);
+    }
+    // "Batal" chip while something is pending
+    if ((pendingTx || pendingPayment) && /batal/i.test(chip.textContent)) {
       addMessage(chip.textContent, 'user');
-      pendingTx = null; renderSuggestions(defaultSuggestions());
+      pendingTx = null; pendingPayment = null; renderSuggestions(defaultSuggestions());
       return botSay('Oke, dibatalkan. Tidak ada yang saya catat. 👍', true);
     }
     handleUserMessage(chip.textContent);
